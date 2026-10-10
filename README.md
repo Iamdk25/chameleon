@@ -92,6 +92,24 @@ engine needs must be installed at **build** time (add it to
 `requirements.txt`), not fetched at run time. If you're using a locally
 hosted model, bake its weights into the image during the build step.
 
+## Context housekeeping
+
+`context/housekeeping.py` is the PR0 slice of text-first CHAMELEON v2.
+`ActiveContext.append()` writes an active text file and, before that file
+would exceed 1,000 lines, copies the current bytes into `archive/` and
+replaces them with a compact summary plus a recent tail. `engine/` and
+`renderer/` are not part of this path.
+
+```bash
+python -m unittest tests.test_context_housekeeping
+```
+
+An active file that is already over the limit can be repaired in place:
+
+```bash
+python -m context.housekeeping path/to/context-directory
+```
+
 ## See also
 
 - `chameleon_design_schema_v0.9.json` — full input/output field spec
