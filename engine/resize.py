@@ -508,6 +508,25 @@ def _score_candidate(elements: list[Element], fg_weights: dict[str, float], tw: 
             cost += (off / max(tw, th)) * weight * 8.0
         if e["type"] == "text" and e.get("font_size", 12) < 11.0:
             cost += (11.0 - e["font_size"]) * weight * 0.6
+        if e["type"] == "text":
+            # A box not overlapping its neighbors' boxes doesn't mean the
+            # TEXT fits inside it - `_fit_font_size` shrinks down to a
+            # floor, but a box can still be too short for even
+            # floor-sized text to wrap into (e.g. several items splitting
+            # very little height). That text then spills past its own
+            # box into whatever's next, which is exactly the "nothing
+            # cut off" / "no unwanted collisions" failure the rubric
+            # names - and it's invisible to the box-overlap check above
+            # since the declared boxes themselves never overlapped.
+            font_size = e.get("font_size", 12)
+            lines = _wrap_and_measure(
+                e.get("content", ""), e.get("font_family", ""), e.get("font_weight"),
+                e.get("font_style"), font_size, max(1.0, e["width"]),
+            )
+            rendered_h = lines * font_size * e.get("line_height", 1.2)
+            overflow = rendered_h - e["height"]
+            if overflow > 0:
+                cost += (overflow / max(1.0, e["height"])) * weight * 25.0
 
     return cost
 
