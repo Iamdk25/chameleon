@@ -59,6 +59,7 @@ model-free reflow engine, not a scale/stretch transform.
    so edges land in alignment instead of at arbitrary sub-pixel offsets.
 """
 
+import math
 from typing import Any, Optional
 
 Element = dict[str, Any]
@@ -229,6 +230,35 @@ def _group_bbox(members: list[Element]) -> Box:
     y0 = min(m["y"] for m in members)
     x1 = max(m["x"] + m["width"] for m in members)
     y1 = max(m["y"] + m["height"] for m in members)
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+def _rotated_bbox(x: float, y: float, w: float, h: float, rotation_deg: float) -> Box:
+    """The axis-aligned box that actually contains a w x h rectangle
+    rotated by `rotation_deg` about its own center. A rotated element's
+    painted extent can stick out past its own unrotated x/y/w/h - e.g. a
+    wide ribbon tilted -12 degrees near a canvas edge or another element
+    can visually clip or collide even when its stored (unrotated) box is
+    fully in bounds and non-overlapping. Collision checks and off-canvas
+    clamping need this, not the raw box, to catch what's actually visible."""
+    if not rotation_deg:
+        return (x, y, w, h)
+    cx, cy = x + w / 2.0, y + h / 2.0
+    rad = math.radians(rotation_deg)
+    cos_a, sin_a = abs(math.cos(rad)), abs(math.sin(rad))
+    new_w, new_h = w * cos_a + h * sin_a, w * sin_a + h * cos_a
+    return (cx - new_w / 2.0, cy - new_h / 2.0, new_w, new_h)
+
+
+def _visual_bbox(members: list[Element]) -> Box:
+    """Like `_group_bbox`, but using each member's rotated (true visual)
+    extent - the right thing to use for collision detection, where what
+    matters is what's actually painted, not the unrotated storage box."""
+    boxes = [_rotated_bbox(m["x"], m["y"], m["width"], m["height"], m.get("rotation", 0)) for m in members]
+    x0 = min(b[0] for b in boxes)
+    y0 = min(b[1] for b in boxes)
+    x1 = max(b[0] + b[2] for b in boxes)
+    y1 = max(b[1] + b[3] for b in boxes)
     return (x0, y0, x1 - x0, y1 - y0)
 
 
@@ -692,6 +722,18 @@ def _build_candidate(
 
     for e in extra_images:
         box = (e["x"] * scale_x, e["y"] * scale_y, e["width"] * scale_x, e["height"] * scale_y)
+        # Extra/uncategorized images are the lowest-priority passthrough
+        # content (e.g. a small corner watermark) - cap their footprint so
+        # they stay a modest accent on any canvas shape instead of scaling
+        # up to a size that competes with real content. This also keeps
+        # the renderer's "missing asset" fallback box (when a referenced
+        # asset is genuinely absent) an unobtrusive corner mark rather
+        # than a large, distracting placeholder.
+        max_dim = min(tw, th) * 0.08
+        if box[2] > max_dim or box[3] > max_dim:
+            shrink = max_dim / max(box[2], box[3])
+            new_w, new_h = box[2] * shrink, box[3] * shrink
+            box = (box[0] + (box[2] - new_w) / 2, box[1] + (box[3] - new_h) / 2, new_w, new_h)
         out.append(_place_image(e, box))
 
     is_strip = archetype == "strip"
@@ -702,12 +744,30 @@ def _build_candidate(
     # when the archetype is "strip".
     passthrough_groups = generic_groups if is_strip else (ribbon_groups + generic_groups)
     if not is_strip:
+        # Letting a collision-pushed ribbon bleed off an arbitrary edge
+        # read as a broken/clipped element in review, not an intentional
+        # corner treatment - only bleed where the source design already
+        # did (the usual rule for every other decorative element), and
+        # rely on the size cap below plus collision resolution to keep
+        # it clear of real content while staying fully on-canvas.
         for _, members in ribbon_groups:
             if any(_is_out_of_bounds(m, sw, sh) for m in members):
                 allow_bleed_ids.update(m["id"] for m in members)
     for _, members in passthrough_groups:
         bbox = _group_bbox(members)
         new_box = (bbox[0] * scale_x, bbox[1] * scale_y, bbox[2] * scale_x, bbox[3] * scale_y)
+        is_ribbon = any(abs(m.get("rotation", 0)) > 0.5 for m in members)
+        if is_ribbon:
+            # Capped like a corner accent (see extra_images above) - a
+            # smaller ribbon is also an easier fit for collision
+            # resolution to find it clean space for, rather than needing
+            # a large push (or an edge bleed) to clear busier content
+            # like a logo/badge row.
+            max_dim = min(tw, th) * 0.15
+            if new_box[2] > max_dim or new_box[3] > max_dim:
+                shrink = max_dim / max(new_box[2], new_box[3])
+                nw, nh = new_box[2] * shrink, new_box[3] * shrink
+                new_box = (new_box[0] + (new_box[2] - nw) / 2, new_box[1] + (new_box[3] - nh) / 2, nw, nh)
         label = next((m for m in members if m["type"] == "text"), None)
         min_size = 10.0
         if label is not None and _text_min_height(label, new_box[2], min_size) > new_box[3]:
@@ -777,8 +837,8 @@ def _resolve_collisions(
             ids_a, wa = units[i]
             for j in range(i + 1, len(units)):
                 ids_b, wb = units[j]
-                ax0, ay0, aw, ah = _group_bbox([by_id[k] for k in ids_a])
-                bx0, by0, bw, bh = _group_bbox([by_id[k] for k in ids_b])
+                ax0, ay0, aw, ah = _visual_bbox([by_id[k] for k in ids_a])
+                bx0, by0, bw, bh = _visual_bbox([by_id[k] for k in ids_b])
                 ox = min(ax0 + aw, bx0 + bw) - max(ax0, bx0)
                 oy = min(ay0 + ah, by0 + bh) - max(ay0, by0)
                 if ox <= 0 or oy <= 0:
@@ -949,11 +1009,26 @@ def _clamp_elements(elements: list[Element], tw: float, th: float, allow_bleed_i
             out.append(e)
             continue
         e = dict(e)
-        w = min(e["width"], tw)
-        h = min(e["height"], th)
-        x = min(max(e["x"], 0.0), max(0.0, tw - w))
-        y = min(max(e["y"], 0.0), max(0.0, th - h))
-        e["x"], e["y"], e["width"], e["height"] = x, y, w, h
+        rotation = e.get("rotation", 0)
+        if rotation:
+            # Clamp by the rotated (true visual) extent, then apply the
+            # same shift to the stored unrotated x/y - width/height stay
+            # as they are (they're the unrotated storage box the renderer
+            # rotates about its own center), only position moves, so a
+            # rotated element can't visually stick off the canvas edge
+            # even though that's invisible if you only look at its
+            # unrotated box.
+            rx, ry, rw, rh = _rotated_bbox(e["x"], e["y"], e["width"], e["height"], rotation)
+            new_rx = min(max(rx, 0.0), max(0.0, tw - rw))
+            new_ry = min(max(ry, 0.0), max(0.0, th - rh))
+            e["x"] += new_rx - rx
+            e["y"] += new_ry - ry
+        else:
+            w = min(e["width"], tw)
+            h = min(e["height"], th)
+            x = min(max(e["x"], 0.0), max(0.0, tw - w))
+            y = min(max(e["y"], 0.0), max(0.0, th - h))
+            e["x"], e["y"], e["width"], e["height"] = x, y, w, h
         out.append(e)
     return out
 
@@ -1196,7 +1271,12 @@ def _layout_strip(
             secondary_true_need = max(secondary_true_need, _text_min_height(label, sw_, _min_size_for(imp, scale=0.5, floor=5.0)))
 
     if has_secondary and avail_h >= 40:
-        gap = max(2.0, th * 0.03)
+        # A rotated element in the secondary band (a ribbon) has a true
+        # visual extent taller than its stored height, which can eat a
+        # couple of px into a too-thin gap and graze the primary row above
+        # it - a slightly larger gap than a non-rotated layout would need
+        # gives that overhang somewhere to go.
+        gap = max(5.0, th * 0.04)
         # The secondary band gets what it actually needs first (capped so
         # it can't swallow the whole row either) - it's the cheaper ask in
         # absolute pixels, same reasoning as `_priority_allocate`'s water
