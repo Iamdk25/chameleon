@@ -1565,14 +1565,14 @@ def _layout_strip(
                     label_ratio = _group_label_height_ratio(item[1])
             if label_for_check is not None and _text_min_height(label_for_check, sw_, base_min) > slot_h * label_ratio:
                 min_size = 5.0  # let _fit_font_size's own search find the best fit down to the floor
-            # Pushed lower than before (was 0.60-0.90): the reviewer read
-            # the primary row (full-opacity headline/CTA) and the
-            # secondary band as competing at similar visual weight rather
-            # than reading as a clear two-tier hierarchy. A starker
-            # opacity gap is a zero-geometry-risk way to make "this is
-            # the message, that's supporting detail" unambiguous at a
-            # glance, without touching any sizing/collision logic.
-            opacity_mult = 0.45 + 0.35 * max(0.0, min(1.0, imp))
+            # Pushed lower again (was 0.45-0.80): a saturated brand color
+            # (a badge sharing the CTA's exact orange) stays eye-catching
+            # even dimmed to ~60%, which an independent review read as
+            # still competing with the CTA for attention rather than
+            # reading as clearly secondary. Lower still reads as
+            # deliberate hierarchy, not an error - zero-geometry-risk,
+            # same as the first pass at this.
+            opacity_mult = 0.32 + 0.28 * max(0.0, min(1.0, imp))
             if is_group:
                 _, members = item
                 placed = _apply_group_transform(members, _group_bbox(members), box, min_size=min_size)
