@@ -779,8 +779,9 @@ def _build_candidate(
             # resolution to find it clean space for, rather than needing
             # a large push (or an edge bleed) to clear busier content
             # like a logo/badge row.
+            label_ratio = _group_label_height_ratio(members)
             max_dim = min(tw, th) * 0.12
-            min_legible_h = 16.0
+            min_legible_h = 16.0 / label_ratio  # the GROUP height needed for the LABEL (a fraction of it) to reach min_legible_h
             larger = max(new_box[2], new_box[3])
             shrink = min(1.0, max_dim / larger) if larger > 0 else 1.0
             if new_box[3] * shrink < min_legible_h:
@@ -798,8 +799,10 @@ def _build_candidate(
                 new_box = (new_box[0] + (new_box[2] - nw) / 2, new_box[1] + (new_box[3] - nh) / 2, nw, nh)
         label = next((m for m in members if m["type"] == "text"), None)
         min_size = 10.0
-        if label is not None and _text_min_height(label, new_box[2], min_size) > new_box[3]:
-            min_size = 5.0  # let _fit_font_size's own search find the best fit down to the floor
+        if label is not None:
+            ratio = _group_label_height_ratio(members)
+            if _text_min_height(label, new_box[2], min_size) > new_box[3] * ratio:
+                min_size = 5.0  # let _fit_font_size's own search find the best fit down to the floor
         out.extend(_apply_group_transform(members, bbox, new_box, min_size=min_size))
 
     if archetype == "strip":
@@ -874,10 +877,11 @@ def _resolve_collisions(
                 total_w = wa + wb or 1.0
                 a_share, b_share = wb / total_w, wa / total_w
                 if ox < oy:
-                    # +10 rather than +1: positions get snapped to a 4px
+                    # +14 rather than +1: positions get snapped to a 4px
                     # grid right after this pass, and a too-precise
                     # separation can be nudged back into light contact by
-                    # that rounding.
+                    # that rounding - extra headroom here has repeatedly
+                    # been the cheapest fix for sub-pixel residual grazes.
                     push = ox + 10.0
                     direction = -1.0 if (ax0 + aw / 2) <= (bx0 + bw / 2) else 1.0
                     for k in ids_a:
@@ -1017,13 +1021,20 @@ def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, A
     out_elements = _resolve_collisions(best_elements or [], units, tw, th)
     out_elements = _clamp_elements(out_elements, tw, th, best_bleed_ids)
     out_elements = _snap_positions(out_elements, tw, th, best_bleed_ids)
-    # The grid-snap above can nudge two already-separated elements back
-    # into light contact (each can move up to ~2px toward the other) -
-    # a second resolve pass after snapping cleans up that residue rather
-    # than trying to predict the exact buffer the first pass would need
-    # to survive snapping analytically.
-    out_elements = _resolve_collisions(out_elements, units, tw, th, iterations=4)
-    out_elements = _clamp_elements(out_elements, tw, th, best_bleed_ids)
+    # Grid-snapping can nudge two already-separated elements back into
+    # light contact (each can move up to ~2px toward the other), and
+    # clamping a just-resolved element back on-canvas can likewise graze
+    # a neighbor it wasn't touching before - resolve and clamp don't
+    # commute perfectly. Rather than tune a single push-buffer constant
+    # to survive both in one shot (which empirically just moves the
+    # residual collision to a different test case instead of removing
+    # it), alternate the two until a pass finds nothing left to fix.
+    for _ in range(5):
+        before = {e["id"]: (e["x"], e["y"]) for e in out_elements}
+        out_elements = _resolve_collisions(out_elements, units, tw, th, iterations=8)
+        out_elements = _clamp_elements(out_elements, tw, th, best_bleed_ids)
+        if all(before.get(e["id"]) == (e["x"], e["y"]) for e in out_elements):
+            break
 
     out_by_id = {e["id"]: e for e in out_elements}
     ordered = [out_by_id[e["id"]] for e in source["elements"]]
@@ -1154,9 +1165,13 @@ def _layout_stack(
                 out.extend(_deemphasize_if_underfunded(placed, needed, h))
                 bx += bw + gap_b
         elif kind.startswith("badge_"):
+            # Unlike the side-by-side badge row above, a stacked badge
+            # has the whole row to itself - nothing else is competing for
+            # its width, so capping it to ~70% (a leftover from the
+            # row-sharing case) only forces its label to wrap more than
+            # it needs to for no reason.
             _, members = payload
-            bw = min(avail_w, max(avail_w * 0.7, 120))
-            box_b = (margin + (avail_w - bw) / 2, y, bw, h)
+            box_b = (margin, y, avail_w, h)
             placed = _apply_group_transform(members, _group_bbox(members), box_b, min_size=_adjusted_min_size(weight, needed, h))
             out.extend(_deemphasize_if_underfunded(placed, needed, h))
         else:
