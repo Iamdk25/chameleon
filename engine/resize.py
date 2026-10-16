@@ -233,6 +233,24 @@ def _group_bbox(members: list[Element]) -> Box:
     return (x0, y0, x1 - x0, y1 - y0)
 
 
+def _group_label_height_ratio(members: list[Element]) -> float:
+    """What fraction of a group's total height its text label actually
+    occupies - e.g. a button's label commonly sits in only the lower half
+    of its background pill, by the source design's own proportions.
+    `_apply_group_transform` scales every member by the same factor, so a
+    content-aware minimum-height check against the label alone understates
+    what the GROUP as a whole needs by roughly this same fraction; dividing
+    by it converts "how much room the label needs" into "how much room the
+    group needs for the label to get that much"."""
+    label = next((m for m in members if m["type"] == "text"), None)
+    if label is None:
+        return 1.0
+    group_h = _group_bbox(members)[3]
+    if group_h <= 0:
+        return 1.0
+    return max(0.15, min(1.0, label["height"] / group_h))
+
+
 def _rotated_bbox(x: float, y: float, w: float, h: float, rotation_deg: float) -> Box:
     """The axis-aligned box that actually contains a w x h rectangle
     rotated by `rotation_deg` about its own center. A rotated element's
@@ -1088,7 +1106,8 @@ def _layout_stack(
                 label = next((m for m in members if m["type"] == "text"), None)
                 min_h = 22.0
                 if label is not None:
-                    min_h = max(min_h, _text_min_height(label, avail_w, _min_size_for(bimp)) * 1.6)
+                    ratio = _group_label_height_ratio(members)
+                    min_h = max(min_h, _text_min_height(label, avail_w, _min_size_for(bimp)) / ratio)
                 items.append((f"badge_{i}", (gid, members), bimp, min_h, _natural_size("badges", bimp, avail_w, avail_h)))
         else:
             badge_weight = sum(importances[f"badge_{i}"] for i in range(n_b)) / n_b
@@ -1100,7 +1119,8 @@ def _layout_stack(
         cta_w_est = min(avail_w, max(avail_w * 0.55, 180))
         min_h = 36.0
         if cta_label is not None:
-            min_h = max(min_h, _text_min_height(cta_label, cta_w_est, _min_size_for(imp)))
+            ratio = _group_label_height_ratio(cta_members)
+            min_h = max(min_h, _text_min_height(cta_label, cta_w_est, _min_size_for(imp)) / ratio)
         items.append(("cta", primary_cta, imp, min_h, _natural_size("cta", imp, avail_w, avail_h)))
     if legal:
         imp = importances["legal"]
@@ -1202,7 +1222,8 @@ def _layout_wide(
         cta_w_est = min(text_w, max(text_w * 0.7, 150))
         min_h = 30.0
         if cta_label is not None:
-            min_h = max(min_h, _text_min_height(cta_label, cta_w_est, _min_size_for(imp)))
+            ratio = _group_label_height_ratio(cta_members)
+            min_h = max(min_h, _text_min_height(cta_label, cta_w_est, _min_size_for(imp)) / ratio)
         sub_items.append(("cta", primary_cta, imp, min_h, _natural_size("cta", imp, text_w, body_h)))
     if legal:
         imp = importances["legal"]
@@ -1275,10 +1296,14 @@ def _layout_strip(
     secondary_true_need = 0.0
     for (item, imp, is_group), sw_ in zip(secondary, slot_sizes):
         label = item if (not is_group and item.get("type") == "text") else None
+        ratio = 1.0
         if is_group:
             label = next((m for m in item[1] if m["type"] == "text"), None)
+            if label is not None:
+                ratio = _group_label_height_ratio(item[1])
         if label is not None:
-            secondary_true_need = max(secondary_true_need, _text_min_height(label, sw_, _min_size_for(imp, scale=0.5, floor=5.0)))
+            needed = _text_min_height(label, sw_, _min_size_for(imp, scale=0.5, floor=5.0)) / ratio
+            secondary_true_need = max(secondary_true_need, needed)
 
     if has_secondary and avail_h >= 40:
         # A rotated element in the secondary band (a ribbon) has a true
@@ -1333,7 +1358,8 @@ def _layout_strip(
         cta_x = pad + row_w - cta_w
         c_min = _min_size_for(importances["cta"], scale=0.6, floor=7.0)
         cta_label = next((m for m in members if m["type"] == "text"), None)
-        if cta_label is not None and _text_min_height(cta_label, cta_w, c_min) > primary_h:
+        cta_ratio = _group_label_height_ratio(members) if cta_label is not None else 1.0
+        if cta_label is not None and _text_min_height(cta_label, cta_w, c_min) > primary_h * cta_ratio:
             c_min = 5.0
         out.extend(_apply_group_transform(members, _group_bbox(members), (cta_x, y0, cta_w, primary_h), min_size=c_min))
 
@@ -1357,11 +1383,21 @@ def _layout_strip(
             # `_adjusted_min_size`) rather than let it overflow into
             # whatever's next.
             label_for_check = item if (not is_group and item["type"] == "text") else None
+            label_ratio = 1.0
             if is_group:
                 label_for_check = next((m for m in item[1] if m["type"] == "text"), None)
-            if label_for_check is not None and _text_min_height(label_for_check, sw_, base_min) > slot_h:
+                if label_for_check is not None:
+                    label_ratio = _group_label_height_ratio(item[1])
+            if label_for_check is not None and _text_min_height(label_for_check, sw_, base_min) > slot_h * label_ratio:
                 min_size = 5.0  # let _fit_font_size's own search find the best fit down to the floor
-            opacity_mult = 0.60 + 0.30 * max(0.0, min(1.0, imp))
+            # Pushed lower than before (was 0.60-0.90): the reviewer read
+            # the primary row (full-opacity headline/CTA) and the
+            # secondary band as competing at similar visual weight rather
+            # than reading as a clear two-tier hierarchy. A starker
+            # opacity gap is a zero-geometry-risk way to make "this is
+            # the message, that's supporting detail" unambiguous at a
+            # glance, without touching any sizing/collision logic.
+            opacity_mult = 0.45 + 0.35 * max(0.0, min(1.0, imp))
             if is_group:
                 _, members = item
                 placed = _apply_group_transform(members, _group_bbox(members), box, min_size=min_size)
