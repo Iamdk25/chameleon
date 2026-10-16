@@ -1203,7 +1203,7 @@ def _layout_strip(
         # filling. The headline/CTA primary row gets whatever's left, with
         # its own content-aware growth below still able to claim a little
         # more if there's genuine slack.
-        secondary_h = max(8.0, min(secondary_true_need, avail_h * 0.55))
+        secondary_h = max(8.0, min(secondary_true_need, avail_h * 0.62))
         primary_h = max(10.0, avail_h - secondary_h - gap)
     else:
         primary_h = avail_h
@@ -1220,7 +1220,11 @@ def _layout_strip(
 
     cta_w = 0.0
     if primary_cta:
-        cta_w = min(row_w * 0.24, max(primary_h * 3.0, 60.0))
+        # primary_h * 5 (not 3) - the tighter multiplier was forcing the
+        # button narrower than its own text needs even when row_w had
+        # plenty of room to spare, which is what pushed "Shop the Summer
+        # Line" to wrap to 2 lines in a box sized for 1.
+        cta_w = min(row_w * 0.24, max(primary_h * 5.0, 70.0))
 
     headline_right = pad + row_w - (cta_w + pad if primary_cta else 0.0)
     headline_w = max(10.0, headline_right - x)
