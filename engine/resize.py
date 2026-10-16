@@ -1644,7 +1644,59 @@ def _layout_strip(
             else:
                 placed = [_place_text(item, box, min_size=min_size)]
             for pe in placed:
-                pe["opacity"] = round(max(0.0, min(1.0, pe.get("opacity", 1.0))) * opacity_mult, 3)
+                # `opacity_mult` targets a final on-screen visibility, not a
+                # flat multiplier - a label whose own `color` already bakes
+                # in reduced alpha (fine-print text styled at 60% by the
+                # source design, unlike every other label here which is
+                # fully opaque) would otherwise get dimmed twice: once by
+                # its own color, again by this multiplier, landing far
+                # fainter than an equally-"secondary" item that started
+                # fully opaque. Dividing out the color's own alpha first
+                # makes every secondary item land at the *same* effective
+                # visibility regardless of how its source color was
+                # authored, instead of punishing pre-dimmed text for being
+                # pre-dimmed.
+                if is_group and pe.get("type") == "text":
+                    # A badge/ribbon's own "secondary" signal already comes
+                    # from its pill background being dimmed - dimming the
+                    # label on top of that too compounds into washed-out,
+                    # low-contrast text (a muted fill *and* faded white
+                    # text), which reads as broken/blurry rather than as
+                    # deliberate hierarchy. Keep the label itself crisp;
+                    # the pill it sits on is what carries the emphasis cue.
+                    compensated = 1.0
+                elif pe.get("type") == "shape" and pe.get("fill_color"):
+                    # The same `opacity_mult` lands very differently
+                    # depending on how dark the fill already is: a near-
+                    # black navy blended at the same alpha as a bright
+                    # orange loses almost all contrast against a dark
+                    # canvas (sampled in practice: a navy pill dimmed this
+                    # way came out within a few RGB values of the
+                    # background right next to it - visually just gone,
+                    # not "subtle"). Boost opacity for dark fills only,
+                    # just enough to keep fill_luminance * opacity above a
+                    # floor - bright fills (already well above that floor
+                    # at the normal `opacity_mult`) are untouched.
+                    try:
+                        from renderer.converter.colorutil import parse_rgba
+
+                        r, g, b, _a = parse_rgba(pe["fill_color"])
+                        luminance = (r + g + b) / (3 * 255.0)
+                    except Exception:
+                        luminance = 1.0
+                    visibility_floor = 0.13
+                    compensated = min(1.0, max(opacity_mult, visibility_floor / max(0.05, luminance)))
+                else:
+                    base_alpha = 1.0
+                    if pe.get("type") == "text" and pe.get("color"):
+                        try:
+                            from renderer.converter.colorutil import parse_rgba
+
+                            base_alpha = max(0.05, parse_rgba(pe["color"])[3])
+                        except Exception:
+                            base_alpha = 1.0
+                    compensated = min(1.0, opacity_mult / base_alpha)
+                pe["opacity"] = round(max(0.0, min(1.0, pe.get("opacity", 1.0))) * compensated, 3)
             out.extend(placed)
             sx += sw_ + sgap
     return out
