@@ -202,6 +202,26 @@ def _avoid_busy_background(
             # meant "not dramatically better" and "no better" were treated
             # the same, when even a small shift measurably helps.
             e["x"], e["y"] = best_x, best_y
+            # A calmer spot is wasted if it's narrower than where the
+            # text started, forcing worse wrapping than before - widen
+            # into whatever's actually free to the right (up to the
+            # nearest real obstacle or the canvas edge) and let the font
+            # re-fit into that room, same fit logic used everywhere else.
+            max_right = tw
+            for oid, obox in other_boxes.items():
+                if oid == eid:
+                    continue
+                ox0, oy0, ow_, oh_ = obox
+                if ox0 > best_x and oy0 < best_y + h and oy0 + oh_ > best_y:
+                    max_right = min(max_right, ox0)
+            avail_w = max_right - best_x
+            if avail_w > w * 1.15:
+                new_size = _fit_font_size(
+                    e["content"], e["font_family"], e.get("font_weight"), e.get("font_style"),
+                    avail_w, h, e.get("line_height", 1.2), e["font_size"], min_size=e["font_size"],
+                )
+                if new_size > e["font_size"]:
+                    e["width"], e["font_size"] = avail_w, new_size
     return elements
 
 
@@ -269,6 +289,55 @@ def _wrap_and_measure(
     return lines
 
 
+def _font_ascent_descent(
+    font_family: str, font_weight: Optional[str], font_style: Optional[str], size: float
+) -> Optional[tuple[float, float]]:
+    """Real (ascent, descent) in px for this font/size, straight from skia's
+    own font metrics - the renderer positions each line's glyphs by
+    `baseline = y - ascent` and `y - ascent + descent` (cr_renderer's
+    `render_text_fill`), so a line's true rendered height is
+    `ascent + descent`, not the nominal `size`. For most of this brand
+    kit's display faces ascent+descent comes out well above `size` (a
+    display serif can be ~1.4x), so a fit/min-height check built on
+    `size` alone quietly lets text run past the bottom of its box - the
+    renderer never clips text, so that overflow is visible, not just a
+    geometry technicality."""
+    manager = _get_font_manager()
+    if manager is None:
+        return None
+    try:
+        import skia
+
+        weight = _normalize_weight(font_weight)
+        style = _font_style_for(font_weight, font_style)
+        ttf_bytes = manager.lookup(font_family, weight, style)
+        typeface = skia.Typeface.MakeFromData(ttf_bytes)
+        font = skia.Font(typeface, size)
+        m = font.getMetrics()
+        return (-m.fAscent, m.fDescent)
+    except Exception:
+        return None
+
+
+def _text_block_height(
+    lines: int, size: float, line_height: float,
+    font_family: str, font_weight: Optional[str], font_style: Optional[str],
+) -> float:
+    """True rendered height of an `lines`-line text block at `size`: each
+    line after the first advances by `size * line_height` (matching
+    cr_renderer's own `line_index * fontSize * lineHeight`), but the block's
+    total height is capped top-and-bottom by the font's real ascent/descent
+    rather than by `size` itself. Falls back to the plain `lines * size *
+    line_height` estimate if font metrics aren't available."""
+    if lines <= 0:
+        return 0.0
+    metrics = _font_ascent_descent(font_family, font_weight, font_style, size)
+    if metrics is None:
+        return lines * size * line_height
+    ascent, descent = metrics
+    return (lines - 1) * size * line_height + (ascent + descent)
+
+
 def _fit_font_size(
     content: str, font_family: str, font_weight: Optional[str], font_style: Optional[str],
     box_w: float, box_h: float, line_height: float, start_size: float, min_size: float = 10.0,
@@ -283,7 +352,8 @@ def _fit_font_size(
     size = seed
     for _ in range(40):
         lines = _wrap_and_measure(content, font_family, font_weight, font_style, size, box_w)
-        if lines * size * line_height <= box_h or size <= min_size:
+        block_h = _text_block_height(lines, size, line_height, font_family, font_weight, font_style)
+        if block_h <= box_h or size <= min_size:
             break
         size = max(min_size, size * 0.92)
     return round(size, 1)
@@ -299,11 +369,10 @@ def _text_min_height(t: Element, width: float, floor_font: float) -> float:
     squeezed by the same arbitrary number - and it's what prevents text
     from overflowing its box in the first place, rather than only
     detecting that overflow after the fact during candidate scoring."""
-    lines = _wrap_and_measure(
-        t.get("content", ""), t.get("font_family", ""), t.get("font_weight"),
-        t.get("font_style"), floor_font, max(1.0, width),
-    )
-    return lines * floor_font * t.get("line_height", 1.2)
+    family, weight, style = t.get("font_family", ""), t.get("font_weight"), t.get("font_style")
+    lines = _wrap_and_measure(t.get("content", ""), family, weight, style, floor_font, max(1.0, width))
+    line_height = t.get("line_height", 1.2)
+    return _text_block_height(lines, floor_font, line_height, family, weight, style)
 
 
 # ---------------------------------------------------------------------------
