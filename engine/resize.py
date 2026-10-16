@@ -165,6 +165,23 @@ def _fit_font_size(
     return round(size, 1)
 
 
+def _text_min_height(t: Element, width: float, floor_font: float) -> float:
+    """The real height `t`'s content needs to wrap and fit at its legibility
+    floor within `width` - using the exact same font-metric wrapping as
+    `_fit_font_size` and the overflow check in `_score_candidate`, not a
+    guess. Feeding this into a layout step's space allocation (instead of a
+    flat guessed min_px) is what lets a long headline or a short badge
+    label each claim the room they actually need, rather than both being
+    squeezed by the same arbitrary number - and it's what prevents text
+    from overflowing its box in the first place, rather than only
+    detecting that overflow after the fact during candidate scoring."""
+    lines = _wrap_and_measure(
+        t.get("content", ""), t.get("font_family", ""), t.get("font_weight"),
+        t.get("font_style"), floor_font, max(1.0, width),
+    )
+    return lines * floor_font * t.get("line_height", 1.2)
+
+
 # ---------------------------------------------------------------------------
 # Geometry helpers
 # ---------------------------------------------------------------------------
@@ -263,6 +280,61 @@ def _distribute(weighted: list[tuple[float, float]], avail: float) -> tuple[list
     return [r * scale for r in raw], gap
 
 
+def _priority_allocate(weighted: list[tuple[float, float]], avail: float, hard_floor_frac: float = 0.45) -> list[float]:
+    """Used when even everyone's true minimum doesn't fit. Uniformly
+    shrinking every item by the same percentage (what `_distribute` does)
+    means a headline gets crushed just as hard as a badge - which is
+    exactly what causes high-importance text to overflow its box and
+    visually collide with its neighbors.
+
+    Every item starts at a reduced hard floor, then the remaining budget
+    is handed out by weighted water-filling (the same idea real
+    bandwidth/resource schedulers use for max-min-fair allocation):
+    repeatedly split whatever's left among items still below their true
+    minimum, in proportion to importance, rather than fully satisfying
+    the single highest-importance item before the next one sees any
+    budget at all. That "winner takes all" order would leave a headline
+    at 100% of its minimum while a badge sits stuck at its hard floor;
+    water-filling instead lets every item make importance-weighted
+    progress, so the least important ones are still visibly compressed
+    but not crushed to an unreadable sliver."""
+    n = len(weighted)
+    if n == 0:
+        return []
+    hard_floors = [mn * hard_floor_frac for _, mn in weighted]
+    total_floor = sum(hard_floors)
+    if total_floor >= avail:
+        scale = (avail / total_floor) if total_floor > 0 else 0.0
+        return [f * scale for f in hard_floors]
+    sizes = list(hard_floors)
+    remaining = avail - total_floor
+    active = [i for i in range(n) if weighted[i][1] > sizes[i]]
+    for _ in range(80):
+        if not active or remaining <= 1e-6:
+            break
+        total_w = sum(weighted[i][0] for i in active) or 1.0
+        still_active = []
+        for i in active:
+            share = remaining * (weighted[i][0] / total_w)
+            want = weighted[i][1] - sizes[i]
+            grant = min(share, want)
+            sizes[i] += grant
+            remaining -= grant
+            if weighted[i][1] - sizes[i] > 1e-6:
+                still_active.append(i)
+        if len(still_active) == len(active):
+            # Nobody got fully satisfied this round (remaining was the
+            # binding constraint for everyone) - one more even split
+            # finishes the job; looping further wouldn't change anything.
+            if remaining > 1e-6 and still_active:
+                bonus = remaining / len(still_active)
+                for i in still_active:
+                    sizes[i] += bonus
+            break
+        active = still_active
+    return sizes
+
+
 def _flow_sizes(
     naturals: list[float], weights: list[float], minimums: list[float], avail: float,
 ) -> tuple[list[float], float, float]:
@@ -271,21 +343,38 @@ def _flow_sizes(
     a matching leading margin - so a sparse design (few elements, lots of
     canvas) reads as a deliberately spaced, centered composition instead of
     a few elements stretched to fill the canvas with dead space trapped
-    inside their own boxes. Falls back to `_distribute`'s proportional
-    shrink (by `weights`, never below `minimums`) when there isn't enough
-    room for natural sizes - i.e. the usual "not enough space" case.
-    Returns (sizes, gap, leading_margin)."""
+    inside their own boxes. When there isn't room for natural sizes but
+    there IS room for everyone's true minimum, falls back to
+    `_distribute`'s proportional shrink. When even minimums don't fit,
+    switches to `_priority_allocate` instead of continuing to shrink
+    proportionally - past the minimum, proportional shrink is what causes
+    important content to overflow its box just as much as unimportant
+    content. Returns (sizes, gap, leading_margin)."""
     n = len(naturals)
     if n == 0 or avail <= 0:
         return [0.0] * n, 0.0, 0.0
     base_gap = max(4.0, avail * 0.02) if n > 1 else 0.0
-    total_natural = sum(naturals)
-    if total_natural + base_gap * (n - 1) <= avail:
-        slack = avail - total_natural - base_gap * (n - 1)
+    if base_gap * (n - 1) > avail * 0.3:
+        base_gap = (avail * 0.3) / max(1, n - 1)
+    # A "natural" size is an aesthetic target, not a hard requirement - it
+    # can legitimately be smaller than what an item's content actually
+    # needs (e.g. a long headline's content-driven minimum can exceed its
+    # importance-based natural size). Comparing only the raw naturals'
+    # total against `avail` would let that slip through: there could be
+    # plenty of room overall while one specific item still gets less than
+    # it needs. `effective` is what each item will actually get in this
+    # branch, so the room check and the returned sizes agree.
+    effective = [max(nat, mn) for nat, mn in zip(naturals, minimums)]
+    total_effective = sum(effective)
+    if total_effective + base_gap * (n - 1) <= avail:
+        slack = avail - total_effective - base_gap * (n - 1)
         portion = slack / (n + 1)
-        return list(naturals), base_gap + portion, portion
-    sizes, gap = _distribute(list(zip(weights, minimums)), avail)
-    return sizes, gap, 0.0
+        return effective, base_gap + portion, portion
+    budget = max(1.0, avail - base_gap * (n - 1))
+    if sum(minimums) <= budget:
+        sizes, _ = _distribute(list(zip(weights, minimums)), avail)
+        return sizes, base_gap, 0.0
+    return _priority_allocate(list(zip(weights, minimums)), budget), base_gap, 0.0
 
 
 # Natural-size targets per flow-item kind: (reference axis, fraction of
@@ -341,6 +430,38 @@ def _min_size_for(importance: float, scale: float = 1.0, floor: float = 6.0) -> 
     preserving the same relative ordering."""
     importance = max(0.0, min(1.0, importance))
     return max(floor, round((6.0 + 11.0 * importance) * scale, 1))
+
+
+def _adjusted_min_size(importance: float, needed_h: float, granted_h: float, scale: float = 1.0) -> float:
+    """The normal legibility floor, except when an item was granted less
+    height than it actually needs (a genuine "not everything fits" case -
+    see `_priority_allocate`). In that case, holding the normal floor just
+    means the text overflows its box and visually collides with whatever's
+    next - letting it shrink further, down to a lower absolute floor,
+    trades a smaller font for actually fitting, which reads as deliberate
+    compression rather than a layout mistake."""
+    base = _min_size_for(importance, scale=scale)
+    if needed_h <= 0 or granted_h >= needed_h:
+        return base
+    shrink = max(0.35, granted_h / needed_h)
+    return max(5.0, round(base * shrink, 1))
+
+
+def _deemphasize_if_underfunded(elements: list[Element], needed_h: float, granted_h: float) -> list[Element]:
+    """When an item was severely underfunded (got well under its true
+    minimum - a genuine "everything doesn't fit" case) and had to shrink
+    past its normal floor to avoid overflowing, a bounded opacity
+    reduction (never below ~0.55, never fully hidden) signals that this
+    is deliberately de-prioritized content rather than a layout mistake -
+    the same visual-hierarchy move already used for the strip archetype's
+    overflow band, applied consistently wherever content ends up this
+    compressed."""
+    if needed_h <= 0 or granted_h >= needed_h * 0.75:
+        return elements
+    mult = max(0.55, min(0.9, 0.5 + 0.4 * (granted_h / needed_h)))
+    for e in elements:
+        e["opacity"] = round(max(0.0, min(1.0, e.get("opacity", 1.0))) * mult, 3)
+    return elements
 
 
 def _compute_importances(
@@ -550,7 +671,19 @@ def _build_candidate(
     for e in standalone_shapes:
         e = _copy_element(e)
         e["x"], e["y"] = e["x"] * scale_x, e["y"] * scale_y
-        e["width"], e["height"] = e["width"] * scale_x, e["height"] * scale_y
+        if e.get("shape_type") == "ellipse":
+            # A circle squashed by independent x/y scaling reads as a
+            # mistake, not a design choice - a 500x500 circle scaled onto
+            # a 1600x400 canvas would otherwise become a 740x185 flattened
+            # blob. Ellipses scale uniformly (by the average of the two
+            # axis scales, so they neither balloon nor shrink to nothing)
+            # and keep their own proportions; rectangles/lines still
+            # stretch with the canvas, which reads as normal for a
+            # decorative panel or divider.
+            uniform = (scale_x + scale_y) / 2.0
+            e["width"], e["height"] = e["width"] * uniform, e["height"] * uniform
+        else:
+            e["width"], e["height"] = e["width"] * scale_x, e["height"] * scale_y
         out.append(e)
 
     for e in extra_images:
@@ -818,19 +951,39 @@ def _layout_stack(
         items.append(("hero", hero, imp, 60, _natural_size("hero", imp, avail_w, avail_h)))
     if headline:
         imp = importances["headline"]
-        items.append(("headline", headline, imp, 30, _natural_size("headline", imp, avail_w, avail_h)))
+        min_h = max(16.0, _text_min_height(headline, avail_w, _min_size_for(imp)))
+        items.append(("headline", headline, imp, min_h, _natural_size("headline", imp, avail_w, avail_h)))
     for i, bt in enumerate(body_texts):
         imp = importances[f"body_{i}"]
-        items.append((f"body_{i}", bt, imp, 18, _natural_size("body", imp, avail_w, avail_h)))
+        min_h = max(14.0, _text_min_height(bt, avail_w, _min_size_for(imp)))
+        items.append((f"body_{i}", bt, imp, min_h, _natural_size("body", imp, avail_w, avail_h)))
     if badges:
-        badge_weight = sum(importances[f"badge_{i}"] for i in range(len(badges))) / len(badges)
-        items.append(("badges", badges, badge_weight, 30, _natural_size("badges", badge_weight, avail_w, avail_h)))
+        n_b = len(badges)
+        if n_b > 1 and avail_w / n_b < 70:
+            # Too narrow for badges side by side (a 45px-wide pill can't
+            # hold "AWARD WINNING 2026" without its label text spilling
+            # out vertically and overlapping whatever's next) - the same
+            # responsive-design move as a nav row becoming a nav column
+            # on a narrow screen: each badge becomes its own full-width
+            # vertical item instead of fighting the others for a sliver
+            # of row width.
+            for i, (gid, members) in enumerate(badges):
+                bimp = importances[f"badge_{i}"]
+                label = next((m for m in members if m["type"] == "text"), None)
+                min_h = 22.0
+                if label is not None:
+                    min_h = max(min_h, _text_min_height(label, avail_w, _min_size_for(bimp)) * 1.6)
+                items.append((f"badge_{i}", (gid, members), bimp, min_h, _natural_size("badges", bimp, avail_w, avail_h)))
+        else:
+            badge_weight = sum(importances[f"badge_{i}"] for i in range(n_b)) / n_b
+            items.append(("badges", badges, badge_weight, 30, _natural_size("badges", badge_weight, avail_w, avail_h)))
     if primary_cta:
         imp = importances["cta"]
         items.append(("cta", primary_cta, imp, 36, _natural_size("cta", imp, avail_w, avail_h)))
     if legal:
         imp = importances["legal"]
-        items.append(("legal", legal, imp, 12, _natural_size("legal", imp, avail_w, avail_h)))
+        min_h = max(10.0, _text_min_height(legal, avail_w, _min_size_for(imp)))
+        items.append(("legal", legal, imp, min_h, _natural_size("legal", imp, avail_w, avail_h)))
     if not items:
         return out
 
@@ -838,7 +991,7 @@ def _layout_stack(
         [it[4] for it in items], [it[2] for it in items], [it[3] for it in items], avail_h,
     )
     y = margin + lead
-    for (kind, payload, weight, _, _), h in zip(items, sizes):
+    for (kind, payload, weight, needed, _), h in zip(items, sizes):
         box = (margin, y, avail_w, h)
         if kind in ("logo", "hero"):
             out.append(_place_image(payload, box))
@@ -846,7 +999,8 @@ def _layout_stack(
             _, members = payload
             cta_w = min(avail_w, max(avail_w * 0.55, 180))
             cta_box = (margin + (avail_w - cta_w) / 2, y, cta_w, h)
-            out.extend(_apply_group_transform(members, _group_bbox(members), cta_box, min_size=_min_size_for(weight)))
+            placed = _apply_group_transform(members, _group_bbox(members), cta_box, min_size=_adjusted_min_size(weight, needed, h))
+            out.extend(_deemphasize_if_underfunded(placed, needed, h))
         elif kind == "badges":
             n_b = len(payload)
             gap_b = max(4.0, avail_w * 0.02) if n_b > 1 else 0.0
@@ -854,10 +1008,18 @@ def _layout_stack(
             bx = margin
             for bi, (_, members) in enumerate(payload):
                 bimp = importances[f"badge_{bi}"]
-                out.extend(_apply_group_transform(members, _group_bbox(members), (bx, y, bw, h), min_size=_min_size_for(bimp)))
+                placed = _apply_group_transform(members, _group_bbox(members), (bx, y, bw, h), min_size=_adjusted_min_size(bimp, needed, h))
+                out.extend(_deemphasize_if_underfunded(placed, needed, h))
                 bx += bw + gap_b
+        elif kind.startswith("badge_"):
+            _, members = payload
+            bw = min(avail_w, max(avail_w * 0.7, 120))
+            box_b = (margin + (avail_w - bw) / 2, y, bw, h)
+            placed = _apply_group_transform(members, _group_bbox(members), box_b, min_size=_adjusted_min_size(weight, needed, h))
+            out.extend(_deemphasize_if_underfunded(placed, needed, h))
         else:
-            out.append(_place_text(payload, box, _min_size_for(weight)))
+            placed = [_place_text(payload, box, _adjusted_min_size(weight, needed, h))]
+            out.extend(_deemphasize_if_underfunded(placed, needed, h))
         y += h + gap
     return out
 
@@ -905,30 +1067,35 @@ def _layout_wide(
     sub_items: list[tuple[str, Any, float, float, float]] = []
     if headline:
         imp = importances["headline"]
-        sub_items.append(("headline", headline, imp, 26, _natural_size("headline", imp, text_w, body_h)))
+        min_h = max(14.0, _text_min_height(headline, text_w, _min_size_for(imp)))
+        sub_items.append(("headline", headline, imp, min_h, _natural_size("headline", imp, text_w, body_h)))
     for i, bt in enumerate(body_texts):
         imp = importances[f"body_{i}"]
-        sub_items.append((f"body_{i}", bt, imp, 16, _natural_size("body", imp, text_w, body_h)))
+        min_h = max(12.0, _text_min_height(bt, text_w, _min_size_for(imp)))
+        sub_items.append((f"body_{i}", bt, imp, min_h, _natural_size("body", imp, text_w, body_h)))
     if primary_cta:
         imp = importances["cta"]
         sub_items.append(("cta", primary_cta, imp, 30, _natural_size("cta", imp, text_w, body_h)))
     if legal:
         imp = importances["legal"]
-        sub_items.append(("legal", legal, imp, 12, _natural_size("legal", imp, text_w, body_h)))
+        min_h = max(10.0, _text_min_height(legal, text_w, _min_size_for(imp)))
+        sub_items.append(("legal", legal, imp, min_h, _natural_size("legal", imp, text_w, body_h)))
 
     if sub_items:
         sizes, gap, lead = _flow_sizes(
             [it[4] for it in sub_items], [it[2] for it in sub_items], [it[3] for it in sub_items], body_h,
         )
         y = body_top + lead
-        for (kind, payload, weight, _, _), h in zip(sub_items, sizes):
+        for (kind, payload, weight, needed, _), h in zip(sub_items, sizes):
             if kind == "cta":
                 _, members = payload
                 cta_w = min(text_w, max(text_w * 0.7, 150))
                 cta_box = (text_x, y, cta_w, h)
-                out.extend(_apply_group_transform(members, _group_bbox(members), cta_box, min_size=_min_size_for(weight)))
+                placed = _apply_group_transform(members, _group_bbox(members), cta_box, min_size=_adjusted_min_size(weight, needed, h))
+                out.extend(_deemphasize_if_underfunded(placed, needed, h))
             else:
-                out.append(_place_text(payload, (text_x, y, text_w, h), _min_size_for(weight)))
+                placed = [_place_text(payload, (text_x, y, text_w, h), _adjusted_min_size(weight, needed, h))]
+                out.extend(_deemphasize_if_underfunded(placed, needed, h))
             y += h + gap
     return out
 
@@ -997,6 +1164,17 @@ def _layout_strip(
     headline_w = max(10.0, headline_right - x)
     if headline:
         h_min = _min_size_for(importances["headline"], scale=0.7, floor=7.5)
+        # `primary_frac` above is an importance-based guess; now that the
+        # headline's actual width is known, check what it really needs and
+        # borrow a bit more from the secondary band if the guess undershot -
+        # the same content-aware-minimum idea as `_flow_sizes`, applied to
+        # the strip's row/band split instead of a vertical stack.
+        if secondary_h > 8.0:
+            needed = _text_min_height(headline, headline_w, h_min)
+            grow = min(max(0.0, needed - primary_h), secondary_h - 8.0)
+            if grow > 0:
+                primary_h += grow
+                secondary_h -= grow
         out.append(_place_text(headline, (x, y0, headline_w, primary_h), min_size=h_min))
 
     if primary_cta:
