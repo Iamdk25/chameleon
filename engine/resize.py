@@ -156,10 +156,14 @@ def _avoid_busy_background(
 ) -> list[Element]:
     """For text sitting directly on the background (not part of a group,
     so it's free to move independently without breaking a button's label
-    alignment), tries a small local jiggle and keeps whichever nearby
-    position reads as calmer - but only moves it if that's a meaningfully
-    better spot, and never into a new collision with other foreground
-    content."""
+    alignment), scans for a calmer spot and keeps whichever one reads as
+    meaningfully better - but only within its own row (a small vertical
+    wiggle, so it doesn't jump to a visually unrelated part of the
+    layout and read as randomly placed) and across the row's FULL width
+    (not just a small local radius - a narrow local-only search can miss
+    a genuinely calm, genuinely empty patch of canvas that happens to be
+    far from where this element started, e.g. past a neighboring image),
+    and never into a new collision with other foreground content."""
     if bg_gray is None or not eligible_ids:
         return elements
     by_id = {e["id"]: e for e in elements}
@@ -169,38 +173,28 @@ def _avoid_busy_background(
             continue
         x, y, w, h = e["x"], e["y"], e["width"], e["height"]
         base_score = _region_busyness(bg_gray, (x, y, w, h))
-        # Always search for a calmer nearby spot rather than pre-filtering
-        # on an absolute "busy enough to bother" threshold - a background
-        # that's lightly textured everywhere (a "decorative dot pattern")
-        # won't read as busy on average even where one specific dot sits
-        # right on a word, so the real signal is relative improvement, not
-        # an absolute cutoff.
         best_x, best_y, best_score = x, y, base_score
-        # X gets a much wider budget than Y: a wide banner usually has
-        # more unused horizontal room nearby than vertical (which is
-        # often fully claimed by a tight row), and the collision check
-        # below still rules out anywhere that's actually taken.
-        rx, ry = max(20.0, w * 0.6), max(6.0, h * 0.7)
-        dx_steps = (-rx, -rx * 0.66, -rx * 0.33, 0.0, rx * 0.33, rx * 0.66, rx)
-        for dx in dx_steps:
-            for dy in (-ry, -ry * 0.5, 0.0, ry * 0.5, ry):
-                if dx == 0.0 and dy == 0.0:
-                    continue
-                nx, ny = x + dx, y + dy
-                if nx < 0 or ny < 0 or nx + w > tw or ny + h > th:
-                    continue
-                collides = False
-                for oid, obox in other_boxes.items():
-                    if oid == eid:
-                        continue
-                    if _overlap_area((nx, ny, w, h), obox) > 4.0:
-                        collides = True
-                        break
-                if collides:
-                    continue
-                score = _region_busyness(bg_gray, (nx, ny, w, h))
-                if score < best_score:
-                    best_score, best_x, best_y = score, nx, ny
+        ry = max(6.0, h * 0.4)
+        step = max(2.0, w * 0.04)
+        for dy in (-ry, -ry * 0.5, 0.0, ry * 0.5, ry):
+            ny = y + dy
+            if ny < 0 or ny + h > th:
+                continue
+            nx = 0.0
+            while nx + w <= tw:
+                if nx != x or ny != y:
+                    collides = False
+                    for oid, obox in other_boxes.items():
+                        if oid == eid:
+                            continue
+                        if _overlap_area((nx, ny, w, h), obox) > 4.0:
+                            collides = True
+                            break
+                    if not collides:
+                        score = _region_busyness(bg_gray, (nx, ny, w, h))
+                        if score < best_score:
+                            best_score, best_x, best_y = score, nx, ny
+                nx += step
         if best_score < base_score - 0.2:
             # In a genuinely cramped layout, a modest improvement (moving
             # a few px off the peak of a dot, even if not fully clearing
