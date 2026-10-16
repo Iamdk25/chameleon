@@ -119,10 +119,13 @@ def _load_cover_background_gray(asset_id: Optional[str], tw: float, th: float):
 
 
 def _region_busyness(bg_gray, box: "Box") -> float:
-    """Standard deviation of grayscale luminance in `box` - a simple, fast
-    proxy for visual texture/contrast. A low-variance patch (a calm part of
-    a gradient) is safer to put text over than a high-variance one (a
-    decorative dot, a texture detail, an edge)."""
+    """The busiest small patch within `box`, not the average over the whole
+    box. A single decorative dot inside an otherwise calm gradient barely
+    moves the box's overall average/stddev if the box is much bigger than
+    the dot - which is exactly the case that matters (a small bright dot
+    sitting on one word of a multi-line fine-print block). Scanning in
+    small blocks and taking the max catches that localized feature instead
+    of averaging it away."""
     if bg_gray is None:
         return 0.0
     try:
@@ -133,7 +136,17 @@ def _region_busyness(bg_gray, box: "Box") -> float:
         y0 = max(0, min(bg_gray.height - 1, int(y0)))
         x1 = max(x0 + 1, min(bg_gray.width, int(x0 + w)))
         y1 = max(y0 + 1, min(bg_gray.height, int(y0 + h)))
-        return ImageStat.Stat(bg_gray.crop((x0, y0, x1, y1))).stddev[0]
+        block = max(6, min(16, (x1 - x0) // 4, (y1 - y0) // 2))
+        worst = 0.0
+        by = y0
+        while by < y1:
+            bx = x0
+            while bx < x1:
+                cell = bg_gray.crop((bx, by, min(bx + block, x1), min(by + block, y1)))
+                worst = max(worst, ImageStat.Stat(cell).stddev[0])
+                bx += block
+            by += block
+        return worst
     except Exception:
         return 0.0
 
@@ -156,11 +169,20 @@ def _avoid_busy_background(
             continue
         x, y, w, h = e["x"], e["y"], e["width"], e["height"]
         base_score = _region_busyness(bg_gray, (x, y, w, h))
-        if base_score < 18.0:
-            continue  # already calm enough - don't bother searching
+        # Always search for a calmer nearby spot rather than pre-filtering
+        # on an absolute "busy enough to bother" threshold - a background
+        # that's lightly textured everywhere (a "decorative dot pattern")
+        # won't read as busy on average even where one specific dot sits
+        # right on a word, so the real signal is relative improvement, not
+        # an absolute cutoff.
         best_x, best_y, best_score = x, y, base_score
-        rx, ry = max(4.0, w * 0.06), max(4.0, h * 0.5)
-        for dx in (-rx, 0.0, rx):
+        # X gets a much wider budget than Y: a wide banner usually has
+        # more unused horizontal room nearby than vertical (which is
+        # often fully claimed by a tight row), and the collision check
+        # below still rules out anywhere that's actually taken.
+        rx, ry = max(20.0, w * 0.6), max(6.0, h * 0.7)
+        dx_steps = (-rx, -rx * 0.66, -rx * 0.33, 0.0, rx * 0.33, rx * 0.66, rx)
+        for dx in dx_steps:
             for dy in (-ry, -ry * 0.5, 0.0, ry * 0.5, ry):
                 if dx == 0.0 and dy == 0.0:
                     continue
@@ -179,7 +201,12 @@ def _avoid_busy_background(
                 score = _region_busyness(bg_gray, (nx, ny, w, h))
                 if score < best_score:
                     best_score, best_x, best_y = score, nx, ny
-        if best_score < base_score - 3.0:
+        if best_score < base_score - 0.2:
+            # In a genuinely cramped layout, a modest improvement (moving
+            # a few px off the peak of a dot, even if not fully clearing
+            # it) is still worth taking - the earlier, stricter threshold
+            # meant "not dramatically better" and "no better" were treated
+            # the same, when even a small shift measurably helps.
             e["x"], e["y"] = best_x, best_y
     return elements
 
@@ -1155,12 +1182,16 @@ def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, A
     if eligible_ids and backgrounds:
         bg_gray = _load_cover_background_gray(backgrounds[0].get("asset_id"), tw, th)
         if bg_gray is not None:
-            unit_ids = set()
-            for ids, _ in units:
-                unit_ids.update(ids)
+            # Deliberately broader than `units` (which excludes ribbons in
+            # the strip archetype, since those are handled by its own
+            # secondary-band placement rather than the general collision
+            # resolver) - a candidate nudge here needs to avoid landing on
+            # ANYTHING actually occupying canvas space, not just the
+            # subset of elements the resolver itself tracks.
+            exclude_ids = {e["id"] for e in backgrounds} | {e["id"] for e in standalone_shapes}
             other_boxes = {
                 e["id"]: (e["x"], e["y"], e["width"], e["height"])
-                for e in out_elements if e["id"] in unit_ids
+                for e in out_elements if e["id"] not in exclude_ids
             }
             out_elements = _avoid_busy_background(out_elements, eligible_ids, other_boxes, bg_gray, tw, th)
             out_elements = _clamp_elements(out_elements, tw, th, best_bleed_ids)
