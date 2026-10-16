@@ -1684,7 +1684,7 @@ def _layout_strip(
                         luminance = (r + g + b) / (3 * 255.0)
                     except Exception:
                         luminance = 1.0
-                    visibility_floor = 0.13
+                    visibility_floor = 0.22
                     compensated = min(1.0, max(opacity_mult, visibility_floor / max(0.05, luminance)))
                 else:
                     base_alpha = 1.0
