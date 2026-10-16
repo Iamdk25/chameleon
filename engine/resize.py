@@ -21,17 +21,25 @@ model-free reflow engine, not a scale/stretch transform.
    templates: a vertical stack (portrait/near-square), a two-column
    horizontal layout (wide banners/posters), or a single-row layout
    (ultra-thin strips like a 728x90 leaderboard).
-3. Each archetype allocates space to the classified roles by priority
-   weight, then places each element (or, for a group, the whole group as
-   one rigid unit so a button's background and label never drift apart)
-   into its slot: images are aspect-preserving "contain"-fit (except
-   `fit:cover`, which is expected to crop), and text's font_size is
-   shrunk/grown to fit using the exact font metrics the real renderer
-   uses (falling back to a rough estimate if that's unavailable).
-4. Purely decorative elements (ungrouped shapes, rotated accent groups)
+3. Importance scoring - each classified item (not just its role, but its
+   own font size/area relative to the rest of *this* design) gets a
+   continuous 0-1 importance score. This replaces flat per-role constants
+   with a signal that varies design-to-design - an unusually large badge
+   or an already-dominant headline earns more room than a role label
+   alone would give it.
+4. Each archetype allocates space by importance weight, then places each
+   element (or, for a group, the whole group as one rigid unit so a
+   button's background and label never drift apart) into its slot:
+   images are aspect-preserving "contain"-fit (except `fit:cover`, which
+   is expected to crop), and text's font_size is shrunk/grown to fit
+   using the exact font metrics the real renderer uses (falling back to
+   a rough estimate if that's unavailable), floored at an
+   importance-scaled minimum so a headline never shrinks as far as fine
+   print.
+5. Purely decorative elements (ungrouped shapes, rotated accent groups)
    are passed through a simple proportional transform instead of being
    forced into the flow - they're meant to bleed/overlap by design.
-5. A final clamp guarantees nothing but an already-intentionally-bleeding
+6. A final clamp guarantees nothing but an already-intentionally-bleeding
    decorative element ends up outside the target canvas.
 """
 
@@ -39,6 +47,7 @@ from typing import Any, Optional
 
 Element = dict[str, Any]
 Box = tuple[float, float, float, float]  # x, y, width, height
+PillGroup = tuple[str, list[Element]]
 
 # ---------------------------------------------------------------------------
 # Text measurement - reuse the vendored renderer's exact font metrics so
@@ -218,7 +227,13 @@ def _apply_group_transform(members: list[Element], old_box: Box, new_box: Box, m
 def _distribute(weighted: list[tuple[float, float]], avail: float) -> tuple[list[float], float]:
     """Splits `avail` px across items by weight, honoring each item's
     minimum where the budget allows and scaling down proportionally
-    (never below its share) when it doesn't. Returns (sizes, gap)."""
+    (never below its share) when it doesn't. Returns (sizes, gap).
+
+    This is the "not enough room" fallback - it fills 100% of `avail` by
+    construction, which is correct when space is scarce, but is the wrong
+    tool when space is generous (see `_flow_sizes`): inflating a band
+    that a centered image or a capped-size text block won't actually fill
+    just moves the blank space inside the band instead of removing it."""
     n = len(weighted)
     if n == 0 or avail <= 0:
         return [0.0] * n, 0.0
@@ -230,6 +245,123 @@ def _distribute(weighted: list[tuple[float, float]], avail: float) -> tuple[list
     raw = [max(mn, budget * (w / total_w)) for w, mn in weighted]
     scale = budget / sum(raw) if sum(raw) > 0 else 1.0
     return [r * scale for r in raw], gap
+
+
+def _flow_sizes(
+    naturals: list[float], weights: list[float], minimums: list[float], avail: float,
+) -> tuple[list[float], float, float]:
+    """Lays items out at their natural (desired) size when there's room for
+    it, spreading any leftover space evenly as extra gap between items plus
+    a matching leading margin - so a sparse design (few elements, lots of
+    canvas) reads as a deliberately spaced, centered composition instead of
+    a few elements stretched to fill the canvas with dead space trapped
+    inside their own boxes. Falls back to `_distribute`'s proportional
+    shrink (by `weights`, never below `minimums`) when there isn't enough
+    room for natural sizes - i.e. the usual "not enough space" case.
+    Returns (sizes, gap, leading_margin)."""
+    n = len(naturals)
+    if n == 0 or avail <= 0:
+        return [0.0] * n, 0.0, 0.0
+    base_gap = max(4.0, avail * 0.02) if n > 1 else 0.0
+    total_natural = sum(naturals)
+    if total_natural + base_gap * (n - 1) <= avail:
+        slack = avail - total_natural - base_gap * (n - 1)
+        portion = slack / (n + 1)
+        return list(naturals), base_gap + portion, portion
+    sizes, gap = _distribute(list(zip(weights, minimums)), avail)
+    return sizes, gap, 0.0
+
+
+# Natural-size targets per flow-item kind: (reference axis, fraction of
+# that axis) at importance == 1.0, scaled down toward 0.55x at
+# importance == 0.0, and capped as a fraction of the available height so
+# nothing with a tiny importance can still claim a huge natural size just
+# because its own original box was large.
+_NATURAL_BASE = {
+    "hero": ("w", 0.50), "logo": ("w", 0.11), "headline": ("h", 0.16),
+    "body": ("h", 0.10), "cta": ("w", 0.095), "badges": ("w", 0.08), "legal": ("h", 0.05),
+}
+_NATURAL_CAP_FRAC = {
+    "hero": 0.60, "logo": 0.22, "headline": 0.40, "body": 0.28,
+    "cta": 0.22, "badges": 0.20, "legal": 0.12,
+}
+
+
+def _natural_size(kind: str, importance: float, avail_w: float, avail_h: float) -> float:
+    axis, frac = _NATURAL_BASE[kind]
+    ref = avail_w if axis == "w" else avail_h
+    scale = 0.55 + 0.9 * max(0.0, min(1.0, importance))
+    size = ref * frac * scale
+    return max(10.0, min(size, avail_h * _NATURAL_CAP_FRAC[kind]))
+
+
+# ---------------------------------------------------------------------------
+# Importance scoring - a continuous 0-1 signal per classified flow item,
+# used in place of fixed per-role constants to drive how much space and
+# how aggressive a legibility floor each element gets. This is what lets
+# e.g. an unusually large badge, or a headline that's already much bigger
+# than its design's other text, earn proportionally more room than a flat
+# "all badges are worth 0.09" rule would give it - a step toward the kind
+# of judgment call a human designer (or a future vision/LLM pass feeding
+# this same dict) would make, while staying fully deterministic for now.
+# ---------------------------------------------------------------------------
+
+_ROLE_BASE_IMPORTANCE = {
+    "headline": 0.90,
+    "cta": 0.75,
+    "hero": 0.70,
+    "logo": 0.45,
+    "body": 0.50,
+    "badge": 0.35,
+    "legal": 0.18,
+}
+
+
+def _min_size_for(importance: float, scale: float = 1.0, floor: float = 6.0) -> float:
+    """Legibility floor for a font_size shrink-to-fit pass: higher-importance
+    text (a headline) is allowed to stay bigger under pressure than
+    lower-importance text (fine print). `scale`/`floor` let tighter
+    archetypes (the ultra-thin strip) compress everything further while
+    preserving the same relative ordering."""
+    importance = max(0.0, min(1.0, importance))
+    return max(floor, round((6.0 + 11.0 * importance) * scale, 1))
+
+
+def _compute_importances(
+    logo: Optional[Element], hero: Optional[Element], headline: Optional[Element],
+    body_texts: list[Element], legal: Optional[Element], primary_cta: Optional[PillGroup],
+    badges: list[PillGroup], sw: float, sh: float,
+) -> dict[str, float]:
+    canvas_area = max(1.0, sw * sh)
+    text_candidates = ([headline] if headline else []) + body_texts + ([legal] if legal else [])
+    max_font = max((t["font_size"] for t in text_candidates), default=1.0)
+
+    def text_score(base: float, el: Element) -> float:
+        return min(1.0, base + 0.15 * (el["font_size"] / max_font))
+
+    def area_score(base: float, w: float, h: float, ref_frac: float) -> float:
+        ratio = (w * h) / canvas_area
+        return min(1.0, base + 0.25 * min(1.0, ratio / ref_frac))
+
+    importances: dict[str, float] = {}
+    if headline:
+        importances["headline"] = text_score(_ROLE_BASE_IMPORTANCE["headline"], headline)
+    if primary_cta:
+        _, members = primary_cta
+        bbox = _group_bbox(members)
+        importances["cta"] = area_score(_ROLE_BASE_IMPORTANCE["cta"], bbox[2], bbox[3], 0.06)
+    if hero:
+        importances["hero"] = area_score(_ROLE_BASE_IMPORTANCE["hero"], hero["width"], hero["height"], 0.25)
+    if logo:
+        importances["logo"] = area_score(_ROLE_BASE_IMPORTANCE["logo"], logo["width"], logo["height"], 0.05)
+    for i, bt in enumerate(body_texts):
+        importances[f"body_{i}"] = text_score(_ROLE_BASE_IMPORTANCE["body"], bt)
+    if legal:
+        importances["legal"] = text_score(_ROLE_BASE_IMPORTANCE["legal"], legal)
+    for i, (_, members) in enumerate(badges):
+        bbox = _group_bbox(members)
+        importances[f"badge_{i}"] = area_score(_ROLE_BASE_IMPORTANCE["badge"], bbox[2], bbox[3], 0.03)
+    return importances
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +446,8 @@ def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, A
     primary_cta = pill_groups[0] if pill_groups else None
     badges = pill_groups[1:]
 
+    importances = _compute_importances(logo, hero, headline, body_texts, legal, primary_cta, badges, sw, sh)
+
     # --- bleed allowance: decorative elements already off the source
     # canvas keep bleeding proportionally; nothing else should end up
     # off-canvas. ---
@@ -357,11 +491,11 @@ def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, A
         out_elements.extend(_apply_group_transform(members, bbox, new_box))
 
     if is_strip:
-        out_elements += _layout_strip(logo, hero, headline, body_texts, legal, primary_cta, badges, ribbon_groups, tw, th, margin)
+        out_elements += _layout_strip(logo, hero, headline, body_texts, legal, primary_cta, badges, ribbon_groups, importances, tw, th, margin)
     elif ratio >= 1.8:
-        out_elements += _layout_wide(logo, hero, headline, body_texts, legal, primary_cta, badges, tw, th, margin)
+        out_elements += _layout_wide(logo, hero, headline, body_texts, legal, primary_cta, badges, importances, tw, th, margin)
     else:
-        out_elements += _layout_stack(logo, hero, headline, body_texts, legal, primary_cta, badges, tw, th, margin)
+        out_elements += _layout_stack(logo, hero, headline, body_texts, legal, primary_cta, badges, importances, tw, th, margin)
 
     out_elements = _clamp_elements(out_elements, tw, th, allow_bleed_ids)
 
@@ -390,58 +524,66 @@ def _clamp_elements(elements: list[Element], tw: float, th: float, allow_bleed_i
 # Layout archetypes
 # ---------------------------------------------------------------------------
 
-PillGroup = tuple[str, list[Element]]
-
 
 def _layout_stack(
     logo: Optional[Element], hero: Optional[Element], headline: Optional[Element],
     body_texts: list[Element], legal: Optional[Element], primary_cta: Optional[PillGroup],
-    badges: list[PillGroup], tw: float, th: float, margin: float,
+    badges: list[PillGroup], importances: dict[str, float], tw: float, th: float, margin: float,
 ) -> list[Element]:
     """Vertical stack for portrait / near-square targets."""
     out: list[Element] = []
     avail_w = max(10.0, tw - 2 * margin)
     avail_h = max(10.0, th - 2 * margin)
 
-    items: list[tuple[str, Any, float, float]] = []
+    items: list[tuple[str, Any, float, float, float]] = []  # kind, payload, weight, min_px, natural_px
     if logo:
-        items.append(("logo", logo, 0.10, 36))
+        imp = importances["logo"]
+        items.append(("logo", logo, imp, 36, _natural_size("logo", imp, avail_w, avail_h)))
     if hero:
-        items.append(("hero", hero, 0.34, 60))
+        imp = importances["hero"]
+        items.append(("hero", hero, imp, 60, _natural_size("hero", imp, avail_w, avail_h)))
     if headline:
-        items.append(("headline", headline, 0.16, 30))
-    for bt in body_texts:
-        items.append(("body", bt, 0.09, 18))
+        imp = importances["headline"]
+        items.append(("headline", headline, imp, 30, _natural_size("headline", imp, avail_w, avail_h)))
+    for i, bt in enumerate(body_texts):
+        imp = importances[f"body_{i}"]
+        items.append((f"body_{i}", bt, imp, 18, _natural_size("body", imp, avail_w, avail_h)))
     if badges:
-        items.append(("badges", badges, 0.09, 30))
+        badge_weight = sum(importances[f"badge_{i}"] for i in range(len(badges))) / len(badges)
+        items.append(("badges", badges, badge_weight, 30, _natural_size("badges", badge_weight, avail_w, avail_h)))
     if primary_cta:
-        items.append(("cta", primary_cta, 0.12, 36))
+        imp = importances["cta"]
+        items.append(("cta", primary_cta, imp, 36, _natural_size("cta", imp, avail_w, avail_h)))
     if legal:
-        items.append(("legal", legal, 0.05, 12))
+        imp = importances["legal"]
+        items.append(("legal", legal, imp, 12, _natural_size("legal", imp, avail_w, avail_h)))
     if not items:
         return out
 
-    sizes, gap = _distribute([(w, mn) for _, _, w, mn in items], avail_h)
-    y = margin
-    for (kind, payload, _, _), h in zip(items, sizes):
+    sizes, gap, lead = _flow_sizes(
+        [it[4] for it in items], [it[2] for it in items], [it[3] for it in items], avail_h,
+    )
+    y = margin + lead
+    for (kind, payload, weight, _, _), h in zip(items, sizes):
         box = (margin, y, avail_w, h)
         if kind in ("logo", "hero"):
             out.append(_place_image(payload, box))
         elif kind == "cta":
             _, members = payload
             cta_w = min(avail_w, max(avail_w * 0.55, 180))
-            out.extend(_apply_group_transform(members, _group_bbox(members), (margin + (avail_w - cta_w) / 2, y, cta_w, h)))
+            cta_box = (margin + (avail_w - cta_w) / 2, y, cta_w, h)
+            out.extend(_apply_group_transform(members, _group_bbox(members), cta_box, min_size=_min_size_for(weight)))
         elif kind == "badges":
             n_b = len(payload)
             gap_b = max(4.0, avail_w * 0.02) if n_b > 1 else 0.0
             bw = max(10.0, min((avail_w - gap_b * (n_b - 1)) / n_b, h * 4.5))
             bx = margin
-            for _, members in payload:
-                out.extend(_apply_group_transform(members, _group_bbox(members), (bx, y, bw, h)))
+            for bi, (_, members) in enumerate(payload):
+                bimp = importances[f"badge_{bi}"]
+                out.extend(_apply_group_transform(members, _group_bbox(members), (bx, y, bw, h), min_size=_min_size_for(bimp)))
                 bx += bw + gap_b
         else:
-            min_size = 8.0 if kind == "legal" else 10.0
-            out.append(_place_text(payload, box, min_size))
+            out.append(_place_text(payload, box, _min_size_for(weight)))
         y += h + gap
     return out
 
@@ -449,7 +591,7 @@ def _layout_stack(
 def _layout_wide(
     logo: Optional[Element], hero: Optional[Element], headline: Optional[Element],
     body_texts: list[Element], legal: Optional[Element], primary_cta: Optional[PillGroup],
-    badges: list[PillGroup], tw: float, th: float, margin: float,
+    badges: list[PillGroup], importances: dict[str, float], tw: float, th: float, margin: float,
 ) -> list[Element]:
     """Two-column layout for wide banners/posters: hero image on the left,
     a top strip for logo/badges, and headline/body/CTA stacked on the
@@ -469,8 +611,10 @@ def _layout_wide(
             n_b = len(badges)
             gap_b = margin if n_b > 1 else 0.0
             bw = max(10.0, min((remaining_w - gap_b * (n_b - 1)) / n_b, strip_h * 4.5))
-            for _, members in badges:
-                out.extend(_apply_group_transform(members, _group_bbox(members), (x, margin, bw, strip_h)))
+            for bi, (_, members) in enumerate(badges):
+                bimp = importances[f"badge_{bi}"]
+                box = (x, margin, bw, strip_h)
+                out.extend(_apply_group_transform(members, _group_bbox(members), box, min_size=_min_size_for(bimp)))
                 x += bw + gap_b
 
     body_top = margin + strip_h + (margin if has_top else 0.0)
@@ -484,27 +628,33 @@ def _layout_wide(
         text_x = margin
     text_w = max(10.0, tw - text_x - margin)
 
-    sub_items: list[tuple[str, Any, float, float]] = []
+    sub_items: list[tuple[str, Any, float, float, float]] = []
     if headline:
-        sub_items.append(("headline", headline, 0.40, 26))
-    for bt in body_texts:
-        sub_items.append(("body", bt, 0.22, 16))
+        imp = importances["headline"]
+        sub_items.append(("headline", headline, imp, 26, _natural_size("headline", imp, text_w, body_h)))
+    for i, bt in enumerate(body_texts):
+        imp = importances[f"body_{i}"]
+        sub_items.append((f"body_{i}", bt, imp, 16, _natural_size("body", imp, text_w, body_h)))
     if primary_cta:
-        sub_items.append(("cta", primary_cta, 0.30, 30))
+        imp = importances["cta"]
+        sub_items.append(("cta", primary_cta, imp, 30, _natural_size("cta", imp, text_w, body_h)))
     if legal:
-        sub_items.append(("legal", legal, 0.10, 12))
+        imp = importances["legal"]
+        sub_items.append(("legal", legal, imp, 12, _natural_size("legal", imp, text_w, body_h)))
 
     if sub_items:
-        sizes, gap = _distribute([(w, mn) for _, _, w, mn in sub_items], body_h)
-        y = body_top
-        for (kind, payload, _, _), h in zip(sub_items, sizes):
+        sizes, gap, lead = _flow_sizes(
+            [it[4] for it in sub_items], [it[2] for it in sub_items], [it[3] for it in sub_items], body_h,
+        )
+        y = body_top + lead
+        for (kind, payload, weight, _, _), h in zip(sub_items, sizes):
             if kind == "cta":
                 _, members = payload
                 cta_w = min(text_w, max(text_w * 0.7, 150))
-                out.extend(_apply_group_transform(members, _group_bbox(members), (text_x, y, cta_w, h)))
+                cta_box = (text_x, y, cta_w, h)
+                out.extend(_apply_group_transform(members, _group_bbox(members), cta_box, min_size=_min_size_for(weight)))
             else:
-                min_size = 8.0 if kind == "legal" else 10.0
-                out.append(_place_text(payload, (text_x, y, text_w, h), min_size))
+                out.append(_place_text(payload, (text_x, y, text_w, h), _min_size_for(weight)))
             y += h + gap
     return out
 
@@ -512,23 +662,44 @@ def _layout_wide(
 def _layout_strip(
     logo: Optional[Element], hero: Optional[Element], headline: Optional[Element],
     body_texts: list[Element], legal: Optional[Element], primary_cta: Optional[PillGroup],
-    badges: list[PillGroup], ribbon_groups: list[PillGroup], tw: float, th: float, margin: float,
+    badges: list[PillGroup], ribbon_groups: list[PillGroup], importances: dict[str, float],
+    tw: float, th: float, margin: float,
 ) -> list[Element]:
     """Single-row layout for ultra-thin strips (e.g. a 728x90 leaderboard).
-    Logo / headline / CTA get the row; anything that doesn't fit (badges,
+    Logo / headline / CTA - the three things a leaderboard ad actually
+    needs to communicate - get the row, with its primary/secondary split
+    sized by how much the headline itself needs rather than a fixed
+    ratio. The product/hero image is deliberately NOT given primary-row
+    space here: at this height it would render as an unrecognizable
+    sliver anyway, so that width is worth more going to the headline/CTA
+    that carry the message. Everything that doesn't fit (hero, badges,
     body copy, legal text) is a genuine "impossible trade-off" at this
     height - every element stays present (ids preserved, nothing hidden
-    via zero opacity) but is compressed into a thin secondary band, or a
-    minimal sliver along the bottom edge if there's truly no room for one."""
+    via zero opacity) in an importance-sorted, importance-sized secondary
+    band, with a modest and bounded opacity de-emphasis (never below
+    ~0.6, still clearly visible) so it reads as deliberate hierarchy
+    rather than clutter competing with the primary row."""
     out: list[Element] = []
     pad = max(3.0, th * 0.08)
     row_w = max(10.0, tw - 2 * pad)
-    secondary_items: list[Any] = list(badges) + list(ribbon_groups) + list(body_texts) + ([legal] if legal else [])
-    has_secondary = bool(secondary_items)
+    # Rotated ribbons aren't part of the classified roles `importances`
+    # covers, so they get a flat low-but-nonzero weight here - they're
+    # decorative accents, not message-bearing content.
+    secondary: list[tuple[Any, float, bool]] = (
+        [(bg, importances[f"badge_{i}"], True) for i, bg in enumerate(badges)]
+        + [(rb, 0.15, True) for rb in ribbon_groups]
+        + ([(hero, importances["hero"], False)] if hero else [])
+        + [(bt, importances[f"body_{i}"], False) for i, bt in enumerate(body_texts)]
+        + ([(legal, importances["legal"], False)] if legal else [])
+    )
+    secondary.sort(key=lambda t: t[1], reverse=True)
+    has_secondary = bool(secondary)
 
     avail_h = max(6.0, th - 2 * pad)
-    if has_secondary and avail_h >= 46:
-        primary_h = round(avail_h * 0.62)
+    headline_imp = importances.get("headline", 0.5) if headline else 0.5
+    primary_frac = 0.54 + 0.24 * headline_imp
+    if has_secondary and avail_h >= 40:
+        primary_h = round(avail_h * primary_frac)
         gap = max(2.0, th * 0.03)
         secondary_h = max(8.0, avail_h - primary_h - gap)
     else:
@@ -540,44 +711,52 @@ def _layout_strip(
     x = pad
 
     if logo:
-        logo_w = min(primary_h * 2.6, row_w * 0.24)
+        logo_w = min(primary_h * 2.6, row_w * 0.22)
         out.append(_place_image(logo, (x, y0, logo_w, primary_h)))
         x += logo_w + pad
 
-    if hero:
-        thumb_w = min(primary_h, row_w * 0.14)
-        out.append(_place_image(hero, (x, y0, thumb_w, primary_h)))
-        x += thumb_w + pad
-
     cta_w = 0.0
     if primary_cta:
-        cta_w = min(row_w * 0.26, max(primary_h * 3.2, 60.0))
+        cta_w = min(row_w * 0.24, max(primary_h * 3.0, 60.0))
 
     headline_right = pad + row_w - (cta_w + pad if primary_cta else 0.0)
     headline_w = max(10.0, headline_right - x)
     if headline:
-        out.append(_place_text(headline, (x, y0, headline_w, primary_h), min_size=9.0))
+        h_min = _min_size_for(importances["headline"], scale=0.7, floor=7.5)
+        out.append(_place_text(headline, (x, y0, headline_w, primary_h), min_size=h_min))
 
     if primary_cta:
         _, members = primary_cta
         cta_x = pad + row_w - cta_w
-        out.extend(_apply_group_transform(members, _group_bbox(members), (cta_x, y0, cta_w, primary_h), min_size=8.0))
+        c_min = _min_size_for(importances["cta"], scale=0.6, floor=7.0)
+        out.extend(_apply_group_transform(members, _group_bbox(members), (cta_x, y0, cta_w, primary_h), min_size=c_min))
 
     if has_secondary:
-        n = len(secondary_items)
-        slot_w = max(6.0, row_w / n)
-        sx = pad
+        # Importance-weighted split, not an equal share - the most
+        # important leftover item (e.g. the hero image, or a badge much
+        # larger than the others) gets the biggest sliver of this
+        # already-scarce band instead of everyone getting an identical
+        # fraction regardless of how much it matters.
+        slot_sizes, sgap = _distribute([(imp, 6.0) for _, imp, _ in secondary], row_w)
         if secondary_h > 0:
-            slot_y, slot_h, min_size = y0 + primary_h + gap, secondary_h, 6.0
+            slot_y, slot_h, scale, floor = y0 + primary_h + gap, secondary_h, 0.5, 5.0
         else:
             slot_h = max(2.0, th * 0.025)
-            slot_y, min_size = th - slot_h, 5.0
-        for item in secondary_items:
-            box = (sx, slot_y, max(6.0, slot_w - 3), slot_h)
-            if isinstance(item, tuple):
+            slot_y, scale, floor = th - slot_h, 0.4, 4.0
+        sx = pad
+        for (item, imp, is_group), sw_ in zip(secondary, slot_sizes):
+            box = (sx, slot_y, sw_, slot_h)
+            min_size = _min_size_for(imp, scale=scale, floor=floor)
+            opacity_mult = 0.60 + 0.30 * max(0.0, min(1.0, imp))
+            if is_group:
                 _, members = item
-                out.extend(_apply_group_transform(members, _group_bbox(members), box, min_size=min_size))
+                placed = _apply_group_transform(members, _group_bbox(members), box, min_size=min_size)
+            elif item["type"] == "image":
+                placed = [_place_image(item, box)]
             else:
-                out.append(_place_text(item, box, min_size=min_size))
-            sx += slot_w
+                placed = [_place_text(item, box, min_size=min_size)]
+            for pe in placed:
+                pe["opacity"] = round(max(0.0, min(1.0, pe.get("opacity", 1.0))) * opacity_mult, 3)
+            out.extend(placed)
+            sx += sw_ + sgap
     return out
