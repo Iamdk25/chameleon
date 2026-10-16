@@ -744,15 +744,13 @@ def _build_candidate(
     # when the archetype is "strip".
     passthrough_groups = generic_groups if is_strip else (ribbon_groups + generic_groups)
     if not is_strip:
-        # Letting a collision-pushed ribbon bleed off an arbitrary edge
-        # read as a broken/clipped element in review, not an intentional
-        # corner treatment - only bleed where the source design already
-        # did (the usual rule for every other decorative element), and
-        # rely on the size cap below plus collision resolution to keep
-        # it clear of real content while staying fully on-canvas.
+        # A corner ribbon is capped to a small, legible size (below) and
+        # collision resolution actively tries to keep it clear of real
+        # content first - bleed only becomes visible in the genuinely
+        # cramped layouts resolution can't fully clear otherwise, not as
+        # a default treatment applied regardless of whether it's needed.
         for _, members in ribbon_groups:
-            if any(_is_out_of_bounds(m, sw, sh) for m in members):
-                allow_bleed_ids.update(m["id"] for m in members)
+            allow_bleed_ids.update(m["id"] for m in members)
     for _, members in passthrough_groups:
         bbox = _group_bbox(members)
         new_box = (bbox[0] * scale_x, bbox[1] * scale_y, bbox[2] * scale_x, bbox[3] * scale_y)
@@ -763,9 +761,21 @@ def _build_candidate(
             # resolution to find it clean space for, rather than needing
             # a large push (or an edge bleed) to clear busier content
             # like a logo/badge row.
-            max_dim = min(tw, th) * 0.15
-            if new_box[2] > max_dim or new_box[3] > max_dim:
-                shrink = max_dim / max(new_box[2], new_box[3])
+            max_dim = min(tw, th) * 0.12
+            min_legible_h = 16.0
+            larger = max(new_box[2], new_box[3])
+            shrink = min(1.0, max_dim / larger) if larger > 0 else 1.0
+            if new_box[3] * shrink < min_legible_h:
+                # A ribbon can already be very short after extreme
+                # vertical compression (e.g. a tall source reflowed into
+                # a short, wide target) before this cap even applies -
+                # shrinking it further to honor the width cap would crush
+                # an already-thin label past legibility. Prioritize
+                # height over strictly honoring the cap: use whichever of
+                # "shrink to the width cap" or "shrink only as far as
+                # keeps the height legible" shrinks less.
+                shrink = max(shrink, min(1.0, min_legible_h / new_box[3])) if new_box[3] > 0 else shrink
+            if shrink < 1.0:
                 nw, nh = new_box[2] * shrink, new_box[3] * shrink
                 new_box = (new_box[0] + (new_box[2] - nw) / 2, new_box[1] + (new_box[3] - nh) / 2, nw, nh)
         label = next((m for m in members if m["type"] == "text"), None)
@@ -823,7 +833,7 @@ def _flow_units(
 
 
 def _resolve_collisions(
-    elements: list[Element], units: list[tuple[list[str], float]], tw: float, th: float, iterations: int = 10,
+    elements: list[Element], units: list[tuple[list[str], float]], tw: float, th: float, iterations: int = 16,
 ) -> list[Element]:
     """Pushes apart any two units whose boxes still overlap after layout,
     along whichever axis needs the smaller nudge, splitting the separation
