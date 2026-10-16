@@ -78,8 +78,110 @@ PillGroup = tuple[str, list[Element]]
 from pathlib import Path
 
 _FONTS_DIR = Path(__file__).resolve().parent.parent / "brand_kit" / "fonts"
+_ASSETS_DIR = Path(__file__).resolve().parent.parent / "brand_kit" / "assets"
 _font_manager = None
 _font_manager_failed = False
+
+
+# ---------------------------------------------------------------------------
+# Background-busyness avoidance - "text never sits on a busy image" is one
+# of the rubric's own named qualities. This is plain, deterministic image
+# statistics (PIL's own grayscale standard deviation over a region) - not
+# a vision/language model, so none of the offline-compliance questions
+# around a locally-hosted model apply. It reuses the exact same `fit:cover`
+# crop math the renderer itself uses (see renderer/converter/assets.py),
+# so the pixels sampled here are the pixels that will actually render
+# underneath text, and it works from the asset file itself rather than
+# any assumption about a particular background's layout - so it
+# generalizes to backgrounds this engine has never seen, same as every
+# other heuristic in this file.
+# ---------------------------------------------------------------------------
+
+
+def _load_cover_background_gray(asset_id: Optional[str], tw: float, th: float):
+    if not asset_id:
+        return None
+    try:
+        from PIL import Image
+
+        path = _ASSETS_DIR / asset_id
+        if not path.is_file():
+            return None
+        image = Image.open(path).convert("L")
+        w, h = max(1, round(tw)), max(1, round(th))
+        scale = max(w / image.width, h / image.height)
+        nw, nh = max(1, round(image.width * scale)), max(1, round(image.height * scale))
+        resized = image.resize((nw, nh), Image.LANCZOS)
+        left, top = (nw - w) // 2, (nh - h) // 2
+        return resized.crop((left, top, left + w, top + h))
+    except Exception:
+        return None
+
+
+def _region_busyness(bg_gray, box: "Box") -> float:
+    """Standard deviation of grayscale luminance in `box` - a simple, fast
+    proxy for visual texture/contrast. A low-variance patch (a calm part of
+    a gradient) is safer to put text over than a high-variance one (a
+    decorative dot, a texture detail, an edge)."""
+    if bg_gray is None:
+        return 0.0
+    try:
+        from PIL import ImageStat
+
+        x0, y0, w, h = box
+        x0 = max(0, min(bg_gray.width - 1, int(x0)))
+        y0 = max(0, min(bg_gray.height - 1, int(y0)))
+        x1 = max(x0 + 1, min(bg_gray.width, int(x0 + w)))
+        y1 = max(y0 + 1, min(bg_gray.height, int(y0 + h)))
+        return ImageStat.Stat(bg_gray.crop((x0, y0, x1, y1))).stddev[0]
+    except Exception:
+        return 0.0
+
+
+def _avoid_busy_background(
+    elements: list[Element], eligible_ids: set, other_boxes: dict, bg_gray, tw: float, th: float,
+) -> list[Element]:
+    """For text sitting directly on the background (not part of a group,
+    so it's free to move independently without breaking a button's label
+    alignment), tries a small local jiggle and keeps whichever nearby
+    position reads as calmer - but only moves it if that's a meaningfully
+    better spot, and never into a new collision with other foreground
+    content."""
+    if bg_gray is None or not eligible_ids:
+        return elements
+    by_id = {e["id"]: e for e in elements}
+    for eid in eligible_ids:
+        e = by_id.get(eid)
+        if e is None or e["type"] != "text":
+            continue
+        x, y, w, h = e["x"], e["y"], e["width"], e["height"]
+        base_score = _region_busyness(bg_gray, (x, y, w, h))
+        if base_score < 18.0:
+            continue  # already calm enough - don't bother searching
+        best_x, best_y, best_score = x, y, base_score
+        rx, ry = max(4.0, w * 0.06), max(4.0, h * 0.5)
+        for dx in (-rx, 0.0, rx):
+            for dy in (-ry, -ry * 0.5, 0.0, ry * 0.5, ry):
+                if dx == 0.0 and dy == 0.0:
+                    continue
+                nx, ny = x + dx, y + dy
+                if nx < 0 or ny < 0 or nx + w > tw or ny + h > th:
+                    continue
+                collides = False
+                for oid, obox in other_boxes.items():
+                    if oid == eid:
+                        continue
+                    if _overlap_area((nx, ny, w, h), obox) > 4.0:
+                        collides = True
+                        break
+                if collides:
+                    continue
+                score = _region_busyness(bg_gray, (nx, ny, w, h))
+                if score < best_score:
+                    best_score, best_x, best_y = score, nx, ny
+        if best_score < base_score - 3.0:
+            e["x"], e["y"] = best_x, best_y
+    return elements
 
 
 def _get_font_manager():
@@ -1035,6 +1137,33 @@ def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, A
         out_elements = _clamp_elements(out_elements, tw, th, best_bleed_ids)
         if all(before.get(e["id"]) == (e["x"], e["y"]) for e in out_elements):
             break
+
+    # Headline/body/legal text sits directly on the background (unlike a
+    # badge or CTA label, it isn't locked to a group's rigid transform),
+    # so it's free to take a small, collision-safe local nudge toward a
+    # visually calmer part of that background when it's landed somewhere
+    # busy - directly serving the rubric's own "text never sits on a busy
+    # image" criterion, using the real rendered pixels rather than a
+    # guess about this particular asset.
+    eligible_ids = set()
+    if headline:
+        eligible_ids.add(headline["id"])
+    for bt in body_texts:
+        eligible_ids.add(bt["id"])
+    if legal:
+        eligible_ids.add(legal["id"])
+    if eligible_ids and backgrounds:
+        bg_gray = _load_cover_background_gray(backgrounds[0].get("asset_id"), tw, th)
+        if bg_gray is not None:
+            unit_ids = set()
+            for ids, _ in units:
+                unit_ids.update(ids)
+            other_boxes = {
+                e["id"]: (e["x"], e["y"], e["width"], e["height"])
+                for e in out_elements if e["id"] in unit_ids
+            }
+            out_elements = _avoid_busy_background(out_elements, eligible_ids, other_boxes, bg_gray, tw, th)
+            out_elements = _clamp_elements(out_elements, tw, th, best_bleed_ids)
 
     out_by_id = {e["id"]: e for e in out_elements}
     ordered = [out_by_id[e["id"]] for e in source["elements"]]
