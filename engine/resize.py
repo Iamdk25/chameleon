@@ -16,11 +16,13 @@ model-free reflow engine, not a scale/stretch transform.
    "ribbon" accent) purely from its geometry, type, z-index and
    group_id - never from its id or content, so this generalizes to
    designs it has never seen.
-2. Archetype selection - the target canvas's aspect ratio (and, for very
-   short canvases, its absolute height) picks one of three layout
-   templates: a vertical stack (portrait/near-square), a two-column
-   horizontal layout (wide banners/posters), or a single-row layout
-   (ultra-thin strips like a 728x90 leaderboard).
+2. Archetype candidates - the target canvas's aspect ratio (and, for very
+   short canvases, its absolute height) narrows the choice to one of
+   three layout templates - a vertical stack (portrait/near-square), a
+   two-column horizontal layout (wide banners/posters), or a single-row
+   layout (ultra-thin strips like a 728x90 leaderboard) - usually just
+   one clear-cut choice, but both neighboring templates near an actual
+   boundary, where the heuristic alone is genuinely ambiguous.
 3. Importance scoring - each classified item (not just its role, but its
    own font size/area relative to the rest of *this* design) gets a
    continuous 0-1 importance score. This replaces flat per-role constants
@@ -39,8 +41,22 @@ model-free reflow engine, not a scale/stretch transform.
 5. Purely decorative elements (ungrouped shapes, rotated accent groups)
    are passed through a simple proportional transform instead of being
    forced into the flow - they're meant to bleed/overlap by design.
-6. A final clamp guarantees nothing but an already-intentionally-bleeding
-   decorative element ends up outside the target canvas.
+6. Candidate scoring - every candidate from step 2 is built out in full
+   and scored on unwanted collisions between message-bearing elements
+   (weighted by importance, extra-penalized for text sitting on an
+   image), compressed/illegible text, and anything left outside the
+   canvas; the lowest-cost candidate wins. For the common case of a
+   single unambiguous candidate this is a formality, but near a genuine
+   boundary it lets real geometry - not a hard cutoff - make the call.
+7. Collision resolution - whichever candidate wins gets a cleanup pass
+   that pushes apart any two message-bearing units (a button's
+   background+label move together) still overlapping after layout,
+   splitting the separation in inverse proportion to importance.
+8. A final clamp guarantees nothing but an already-intentionally-bleeding
+   decorative element ends up outside the target canvas, followed by a
+   grid-snap of every element's position (never its size) to a small
+   pixel grid - the alignment discipline real design tools default to -
+   so edges land in alignment instead of at arbitrary sub-pixel offsets.
 """
 
 from typing import Any, Optional
@@ -386,6 +402,271 @@ def _is_out_of_bounds(e: Element, w: float, h: float) -> bool:
     return e["x"] < -0.5 or e["y"] < -0.5 or e["x"] + e["width"] > w + 0.5 or e["y"] + e["height"] > h + 0.5
 
 
+# ---------------------------------------------------------------------------
+# Candidate generation and scoring - the archetype thresholds in
+# `_candidate_archetypes` are a strong prior, not a guess: for an
+# unambiguous target shape (e.g. a 1:1 square or a 9:16 story), the "right"
+# archetype genuinely is clear-cut and trying alternatives would just waste
+# work. Near a boundary, though, the heuristic is genuinely uncertain, so
+# both neighboring archetypes get built in full and scored - the same
+# qualities the brief's own rubric names (unwanted collisions, text
+# readability, nothing cut off) decide the winner instead of a hard cutoff
+# guessing blind.
+# ---------------------------------------------------------------------------
+
+
+def _candidate_archetypes(th: float, ratio: float) -> list[str]:
+    if th < 160:
+        archetypes = ["strip"]
+        if th >= 120:
+            archetypes.append("wide" if ratio >= 1.8 else "stack")
+        return archetypes
+    if ratio >= 1.8:
+        archetypes = ["wide"]
+        if ratio <= 2.3:
+            archetypes.append("stack")
+        return archetypes
+    archetypes = ["stack"]
+    if ratio >= 1.45:
+        archetypes.append("wide")
+    return archetypes
+
+
+def _foreground_weights(
+    logo: Optional[Element], hero: Optional[Element], headline: Optional[Element],
+    body_texts: list[Element], legal: Optional[Element], primary_cta: Optional[PillGroup],
+    badges: list[PillGroup], importances: dict[str, float],
+) -> dict[str, float]:
+    """Element id -> importance, for every id that should participate in
+    collision scoring (message-bearing content). Background and purely
+    decorative elements are deliberately left out - they're expected to be
+    overlapped, so penalizing that would fight the brief's own distinction
+    ("overlaps are fine when they're intentional... what matters is that
+    elements that shouldn't overlap, don't")."""
+    weights: dict[str, float] = {}
+    if logo:
+        weights[logo["id"]] = importances["logo"]
+    if hero:
+        weights[hero["id"]] = importances["hero"]
+    if headline:
+        weights[headline["id"]] = importances["headline"]
+    for i, bt in enumerate(body_texts):
+        weights[bt["id"]] = importances[f"body_{i}"]
+    if legal:
+        weights[legal["id"]] = importances["legal"]
+    if primary_cta:
+        _, members = primary_cta
+        for m in members:
+            weights[m["id"]] = importances["cta"]
+    for i, (_, members) in enumerate(badges):
+        for m in members:
+            weights[m["id"]] = importances[f"badge_{i}"]
+    return weights
+
+
+def _overlap_area(a: Box, b: Box) -> float:
+    ax0, ay0, aw, ah = a
+    bx0, by0, bw, bh = b
+    ax1, ay1, bx1, by1 = ax0 + aw, ay0 + ah, bx0 + bw, by0 + bh
+    ox = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    oy = max(0.0, min(ay1, by1) - max(ay0, by0))
+    return ox * oy
+
+
+def _score_candidate(elements: list[Element], fg_weights: dict[str, float], tw: float, th: float) -> float:
+    """Lower is better. Penalizes unwanted collisions between message-bearing
+    elements (weighted by how important each one is, and extra-penalized
+    when it's specifically text sitting on an image), small/compressed
+    text, and anything left outside the canvas - mirroring the brief's own
+    "what a good result looks like" criteria rather than an arbitrary
+    metric."""
+    canvas_area = max(1.0, tw * th)
+    by_id = {e["id"]: e for e in elements}
+    fg_ids = [i for i in fg_weights if i in by_id]
+
+    cost = 0.0
+    for i in range(len(fg_ids)):
+        a = by_id[fg_ids[i]]
+        box_a = (a["x"], a["y"], a["width"], a["height"])
+        for j in range(i + 1, len(fg_ids)):
+            b = by_id[fg_ids[j]]
+            overlap = _overlap_area(box_a, (b["x"], b["y"], b["width"], b["height"]))
+            if overlap <= 0:
+                continue
+            penalty = (overlap / canvas_area) * fg_weights[a["id"]] * fg_weights[b["id"]] * 40.0
+            if {a["type"], b["type"]} == {"text", "image"}:
+                penalty *= 2.5
+            cost += penalty
+
+    for eid, weight in fg_weights.items():
+        e = by_id.get(eid)
+        if e is None:
+            continue
+        x1, y1 = e["x"] + e["width"], e["y"] + e["height"]
+        off = max(0.0, -e["x"]) + max(0.0, -e["y"]) + max(0.0, x1 - tw) + max(0.0, y1 - th)
+        if off > 0:
+            cost += (off / max(tw, th)) * weight * 8.0
+        if e["type"] == "text" and e.get("font_size", 12) < 11.0:
+            cost += (11.0 - e["font_size"]) * weight * 0.6
+
+    return cost
+
+
+def _build_candidate(
+    archetype: str,
+    backgrounds: list[Element], standalone_shapes: list[Element], extra_images: list[Element],
+    generic_groups: list[PillGroup], ribbon_groups: list[PillGroup],
+    logo: Optional[Element], hero: Optional[Element], headline: Optional[Element],
+    body_texts: list[Element], legal: Optional[Element], primary_cta: Optional[PillGroup],
+    badges: list[PillGroup], importances: dict[str, float],
+    scale_x: float, scale_y: float, sw: float, sh: float, tw: float, th: float, margin: float,
+) -> tuple[list[Element], set]:
+    out: list[Element] = []
+
+    for e in backgrounds:
+        e = _copy_element(e)
+        e["x"], e["y"], e["width"], e["height"] = 0.0, 0.0, tw, th
+        out.append(e)
+
+    for e in standalone_shapes:
+        e = _copy_element(e)
+        e["x"], e["y"] = e["x"] * scale_x, e["y"] * scale_y
+        e["width"], e["height"] = e["width"] * scale_x, e["height"] * scale_y
+        out.append(e)
+
+    for e in extra_images:
+        box = (e["x"] * scale_x, e["y"] * scale_y, e["width"] * scale_x, e["height"] * scale_y)
+        out.append(_place_image(e, box))
+
+    is_strip = archetype == "strip"
+    allow_bleed_ids = {e["id"] for e in standalone_shapes if _is_out_of_bounds(e, sw, sh)}
+
+    # See the module-level note on `_layout_strip` for why ribbons route
+    # through the strip's own secondary band instead of this passthrough
+    # when the archetype is "strip".
+    passthrough_groups = generic_groups if is_strip else (ribbon_groups + generic_groups)
+    if not is_strip:
+        for _, members in ribbon_groups:
+            if any(_is_out_of_bounds(m, sw, sh) for m in members):
+                allow_bleed_ids.update(m["id"] for m in members)
+    for _, members in passthrough_groups:
+        bbox = _group_bbox(members)
+        new_box = (bbox[0] * scale_x, bbox[1] * scale_y, bbox[2] * scale_x, bbox[3] * scale_y)
+        out.extend(_apply_group_transform(members, bbox, new_box))
+
+    if archetype == "strip":
+        out += _layout_strip(logo, hero, headline, body_texts, legal, primary_cta, badges, ribbon_groups, importances, tw, th, margin)
+    elif archetype == "wide":
+        out += _layout_wide(logo, hero, headline, body_texts, legal, primary_cta, badges, importances, tw, th, margin)
+    else:
+        out += _layout_stack(logo, hero, headline, body_texts, legal, primary_cta, badges, importances, tw, th, margin)
+
+    return out, allow_bleed_ids
+
+
+# ---------------------------------------------------------------------------
+# Collision resolution and grid alignment - two more of the rubric's own
+# criteria ("no unwanted collisions", "things line up") applied directly as
+# a cleanup pass on whichever candidate wins, rather than trusting layout
+# math alone to always land clean. These are deliberately geometry-only
+# (no change to what gets chosen) so they add robustness without adding
+# risk to the archetype logic itself.
+# ---------------------------------------------------------------------------
+
+
+def _flow_units(
+    logo: Optional[Element], hero: Optional[Element], headline: Optional[Element],
+    body_texts: list[Element], legal: Optional[Element], primary_cta: Optional[PillGroup],
+    badges: list[PillGroup], importances: dict[str, float],
+) -> list[tuple[list[str], float]]:
+    """The same message-bearing content as `_foreground_weights`, but kept
+    as rigid units (all of a group's member ids together) rather than
+    individual ids - so resolving a collision nudges a button's background
+    and label as one piece instead of prying them apart."""
+    units: list[tuple[list[str], float]] = []
+    if logo:
+        units.append(([logo["id"]], importances["logo"]))
+    if hero:
+        units.append(([hero["id"]], importances["hero"]))
+    if headline:
+        units.append(([headline["id"]], importances["headline"]))
+    for i, bt in enumerate(body_texts):
+        units.append(([bt["id"]], importances[f"body_{i}"]))
+    if legal:
+        units.append(([legal["id"]], importances["legal"]))
+    if primary_cta:
+        _, members = primary_cta
+        units.append(([m["id"] for m in members], importances["cta"]))
+    for i, (_, members) in enumerate(badges):
+        units.append(([m["id"] for m in members], importances[f"badge_{i}"]))
+    return units
+
+
+def _resolve_collisions(
+    elements: list[Element], units: list[tuple[list[str], float]], tw: float, th: float, iterations: int = 4,
+) -> list[Element]:
+    """Pushes apart any two units whose boxes still overlap after layout,
+    along whichever axis needs the smaller nudge, splitting the separation
+    between them in inverse proportion to importance (the less important
+    one gives way more). A few iterations handle chains of overlaps; it
+    settles as soon as a pass makes no changes."""
+    by_id = {e["id"]: e for e in elements}
+    for _ in range(iterations):
+        moved = False
+        for i in range(len(units)):
+            ids_a, wa = units[i]
+            for j in range(i + 1, len(units)):
+                ids_b, wb = units[j]
+                ax0, ay0, aw, ah = _group_bbox([by_id[k] for k in ids_a])
+                bx0, by0, bw, bh = _group_bbox([by_id[k] for k in ids_b])
+                ox = min(ax0 + aw, bx0 + bw) - max(ax0, bx0)
+                oy = min(ay0 + ah, by0 + bh) - max(ay0, by0)
+                if ox <= 0 or oy <= 0:
+                    continue
+                total_w = wa + wb or 1.0
+                a_share, b_share = wb / total_w, wa / total_w
+                if ox < oy:
+                    push = ox + 1.0
+                    direction = -1.0 if (ax0 + aw / 2) <= (bx0 + bw / 2) else 1.0
+                    for k in ids_a:
+                        el = by_id[k]
+                        el["x"] = max(0.0, min(tw - el["width"], el["x"] + direction * push * a_share))
+                    for k in ids_b:
+                        el = by_id[k]
+                        el["x"] = max(0.0, min(tw - el["width"], el["x"] - direction * push * b_share))
+                else:
+                    push = oy + 1.0
+                    direction = -1.0 if (ay0 + ah / 2) <= (by0 + bh / 2) else 1.0
+                    for k in ids_a:
+                        el = by_id[k]
+                        el["y"] = max(0.0, min(th - el["height"], el["y"] + direction * push * a_share))
+                    for k in ids_b:
+                        el = by_id[k]
+                        el["y"] = max(0.0, min(th - el["height"], el["y"] - direction * push * b_share))
+                moved = True
+        if not moved:
+            break
+    return elements
+
+
+def _snap_positions(elements: list[Element], tw: float, th: float, allow_bleed_ids: set, grid: float = 4.0) -> list[Element]:
+    """Snaps every element's position (never its width/height, so this never
+    touches text wrapping or an image's aspect ratio) to a small pixel
+    grid - the same alignment discipline real design tools default to
+    (Figma/Illustrator's pixel grid), so edges land in alignment instead of
+    at arbitrary sub-pixel offsets."""
+    out = []
+    for e in elements:
+        e = dict(e)
+        x, y = round(e["x"] / grid) * grid, round(e["y"] / grid) * grid
+        if e["id"] not in allow_bleed_ids:
+            x = max(0.0, min(x, max(0.0, tw - e["width"])))
+            y = max(0.0, min(y, max(0.0, th - e["height"])))
+        e["x"], e["y"] = x, y
+        out.append(e)
+    return out
+
+
 def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, Any]:
     """See module docstring for the approach. Returns a design dict with the
     same shape as `source`, resized/reflowed - never stretched - into
@@ -447,57 +728,31 @@ def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, A
     badges = pill_groups[1:]
 
     importances = _compute_importances(logo, hero, headline, body_texts, legal, primary_cta, badges, sw, sh)
-
-    # --- bleed allowance: decorative elements already off the source
-    # canvas keep bleeding proportionally; nothing else should end up
-    # off-canvas. ---
-    allow_bleed_ids = {e["id"] for e in standalone_shapes if _is_out_of_bounds(e, sw, sh)}
-
-    out_elements: list[Element] = []
-
-    for e in backgrounds:
-        e = _copy_element(e)
-        e["x"], e["y"], e["width"], e["height"] = 0.0, 0.0, tw, th
-        out_elements.append(e)
-
-    for e in standalone_shapes:
-        e = _copy_element(e)
-        e["x"], e["y"] = e["x"] * scale_x, e["y"] * scale_y
-        e["width"], e["height"] = e["width"] * scale_x, e["height"] * scale_y
-        out_elements.append(e)
-
-    for e in extra_images:
-        box = (e["x"] * scale_x, e["y"] * scale_y, e["width"] * scale_x, e["height"] * scale_y)
-        out_elements.append(_place_image(e, box))
-
     margin = max(8.0, min(tw, th) * 0.045)
     ratio = tw / th
-    is_strip = th < 160
 
-    # A decorative ribbon's "near its original corner" placement only makes
-    # sense when there's enough canvas for a corner to mean something. In an
-    # ultra-thin strip, a simple proportional passthrough would almost
-    # certainly land it on top of the primary row (logo/headline/CTA), so
-    # it's folded into the strip's deprioritized secondary band instead -
-    # same treatment as badges, just still carrying its rotation.
-    passthrough_groups = generic_groups if is_strip else (ribbon_groups + generic_groups)
-    if not is_strip:
-        for _, members in ribbon_groups:
-            if any(_is_out_of_bounds(m, sw, sh) for m in members):
-                allow_bleed_ids.update(m["id"] for m in members)
-    for _, members in passthrough_groups:
-        bbox = _group_bbox(members)
-        new_box = (bbox[0] * scale_x, bbox[1] * scale_y, bbox[2] * scale_x, bbox[3] * scale_y)
-        out_elements.extend(_apply_group_transform(members, bbox, new_box))
+    # Build every genuinely-plausible archetype in full (see
+    # `_candidate_archetypes` - usually just the one clear-cut choice, two
+    # only near an actual boundary) and keep whichever scores best, instead
+    # of letting a hard aspect-ratio cutoff decide blind.
+    fg_weights = _foreground_weights(logo, hero, headline, body_texts, legal, primary_cta, badges, importances)
+    best_elements: Optional[list[Element]] = None
+    best_bleed_ids: set = set()
+    best_score = float("inf")
+    for name in _candidate_archetypes(th, ratio):
+        cand_elements, cand_bleed_ids = _build_candidate(
+            name, backgrounds, standalone_shapes, extra_images, generic_groups, ribbon_groups,
+            logo, hero, headline, body_texts, legal, primary_cta, badges, importances,
+            scale_x, scale_y, sw, sh, tw, th, margin,
+        )
+        score = _score_candidate(cand_elements, fg_weights, tw, th)
+        if score < best_score:
+            best_score, best_elements, best_bleed_ids = score, cand_elements, cand_bleed_ids
 
-    if is_strip:
-        out_elements += _layout_strip(logo, hero, headline, body_texts, legal, primary_cta, badges, ribbon_groups, importances, tw, th, margin)
-    elif ratio >= 1.8:
-        out_elements += _layout_wide(logo, hero, headline, body_texts, legal, primary_cta, badges, importances, tw, th, margin)
-    else:
-        out_elements += _layout_stack(logo, hero, headline, body_texts, legal, primary_cta, badges, importances, tw, th, margin)
-
-    out_elements = _clamp_elements(out_elements, tw, th, allow_bleed_ids)
+    units = _flow_units(logo, hero, headline, body_texts, legal, primary_cta, badges, importances)
+    out_elements = _resolve_collisions(best_elements or [], units, tw, th)
+    out_elements = _clamp_elements(out_elements, tw, th, best_bleed_ids)
+    out_elements = _snap_positions(out_elements, tw, th, best_bleed_ids)
 
     out_by_id = {e["id"]: e for e in out_elements}
     ordered = [out_by_id[e["id"]] for e in source["elements"]]
