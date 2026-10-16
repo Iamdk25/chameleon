@@ -437,14 +437,18 @@ def _adjusted_min_size(importance: float, needed_h: float, granted_h: float, sca
     height than it actually needs (a genuine "not everything fits" case -
     see `_priority_allocate`). In that case, holding the normal floor just
     means the text overflows its box and visually collides with whatever's
-    next - letting it shrink further, down to a lower absolute floor,
-    trades a smaller font for actually fitting, which reads as deliberate
-    compression rather than a layout mistake."""
+    next, so this hands `_fit_font_size` the lowest floor it's allowed to
+    use instead - text height doesn't scale linearly with font size (a
+    smaller font fits more characters per line, so lines shrink faster
+    than the font does), so pre-computing an intermediate "just shrunk
+    enough" floor would be guessing; `_fit_font_size` already iteratively
+    searches for the largest font that fits down to whatever floor it's
+    given, so the right move is to open up the full range and let that
+    search do the real work, not second-guess it with an estimate."""
     base = _min_size_for(importance, scale=scale)
     if needed_h <= 0 or granted_h >= needed_h:
         return base
-    shrink = max(0.35, granted_h / needed_h)
-    return max(5.0, round(base * shrink, 1))
+    return 5.0
 
 
 def _deemphasize_if_underfunded(elements: list[Element], needed_h: float, granted_h: float) -> list[Element]:
@@ -704,7 +708,11 @@ def _build_candidate(
     for _, members in passthrough_groups:
         bbox = _group_bbox(members)
         new_box = (bbox[0] * scale_x, bbox[1] * scale_y, bbox[2] * scale_x, bbox[3] * scale_y)
-        out.extend(_apply_group_transform(members, bbox, new_box))
+        label = next((m for m in members if m["type"] == "text"), None)
+        min_size = 10.0
+        if label is not None and _text_min_height(label, new_box[2], min_size) > new_box[3]:
+            min_size = 5.0  # let _fit_font_size's own search find the best fit down to the floor
+        out.extend(_apply_group_transform(members, bbox, new_box, min_size=min_size))
 
     if archetype == "strip":
         out += _layout_strip(logo, hero, headline, body_texts, legal, primary_cta, badges, ribbon_groups, importances, tw, th, margin)
@@ -755,7 +763,7 @@ def _flow_units(
 
 
 def _resolve_collisions(
-    elements: list[Element], units: list[tuple[list[str], float]], tw: float, th: float, iterations: int = 4,
+    elements: list[Element], units: list[tuple[list[str], float]], tw: float, th: float, iterations: int = 10,
 ) -> list[Element]:
     """Pushes apart any two units whose boxes still overlap after layout,
     along whichever axis needs the smaller nudge, splitting the separation
@@ -778,7 +786,11 @@ def _resolve_collisions(
                 total_w = wa + wb or 1.0
                 a_share, b_share = wb / total_w, wa / total_w
                 if ox < oy:
-                    push = ox + 1.0
+                    # +10 rather than +1: positions get snapped to a 4px
+                    # grid right after this pass, and a too-precise
+                    # separation can be nudged back into light contact by
+                    # that rounding.
+                    push = ox + 10.0
                     direction = -1.0 if (ax0 + aw / 2) <= (bx0 + bw / 2) else 1.0
                     for k in ids_a:
                         el = by_id[k]
@@ -787,7 +799,7 @@ def _resolve_collisions(
                         el = by_id[k]
                         el["x"] = max(0.0, min(tw - el["width"], el["x"] - direction * push * b_share))
                 else:
-                    push = oy + 1.0
+                    push = oy + 10.0
                     direction = -1.0 if (ay0 + ah / 2) <= (by0 + bh / 2) else 1.0
                     for k in ids_a:
                         el = by_id[k]
@@ -890,6 +902,7 @@ def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, A
     fg_weights = _foreground_weights(logo, hero, headline, body_texts, legal, primary_cta, badges, importances)
     best_elements: Optional[list[Element]] = None
     best_bleed_ids: set = set()
+    best_name = ""
     best_score = float("inf")
     for name in _candidate_archetypes(th, ratio):
         cand_elements, cand_bleed_ids = _build_candidate(
@@ -899,12 +912,30 @@ def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, A
         )
         score = _score_candidate(cand_elements, fg_weights, tw, th)
         if score < best_score:
-            best_score, best_elements, best_bleed_ids = score, cand_elements, cand_bleed_ids
+            best_score, best_elements, best_bleed_ids, best_name = score, cand_elements, cand_bleed_ids, name
 
+    # Ribbons (outside the strip archetype, where they're already placed
+    # in-flow) and uncategorized "extra" images are positioned by simple
+    # proportional passthrough, completely independent of where the
+    # chosen archetype reflowed everything else - at an aspect ratio far
+    # from the source's, that can land them right on top of reflowed
+    # content (e.g. a logo that moved, or legal text that's now
+    # elsewhere). Including them here as low-importance units lets them
+    # get pushed aside on contact instead of silently overlapping it.
     units = _flow_units(logo, hero, headline, body_texts, legal, primary_cta, badges, importances)
+    if best_name != "strip":
+        units += [([m["id"] for m in members], 0.15) for _, members in ribbon_groups]
+    units += [([e["id"]], 0.2) for e in extra_images]
     out_elements = _resolve_collisions(best_elements or [], units, tw, th)
     out_elements = _clamp_elements(out_elements, tw, th, best_bleed_ids)
     out_elements = _snap_positions(out_elements, tw, th, best_bleed_ids)
+    # The grid-snap above can nudge two already-separated elements back
+    # into light contact (each can move up to ~2px toward the other) -
+    # a second resolve pass after snapping cleans up that residue rather
+    # than trying to predict the exact buffer the first pass would need
+    # to survive snapping analytically.
+    out_elements = _resolve_collisions(out_elements, units, tw, th, iterations=4)
+    out_elements = _clamp_elements(out_elements, tw, th, best_bleed_ids)
 
     out_by_id = {e["id"]: e for e in out_elements}
     ordered = [out_by_id[e["id"]] for e in source["elements"]]
@@ -979,7 +1010,13 @@ def _layout_stack(
             items.append(("badges", badges, badge_weight, 30, _natural_size("badges", badge_weight, avail_w, avail_h)))
     if primary_cta:
         imp = importances["cta"]
-        items.append(("cta", primary_cta, imp, 36, _natural_size("cta", imp, avail_w, avail_h)))
+        _, cta_members = primary_cta
+        cta_label = next((m for m in cta_members if m["type"] == "text"), None)
+        cta_w_est = min(avail_w, max(avail_w * 0.55, 180))
+        min_h = 36.0
+        if cta_label is not None:
+            min_h = max(min_h, _text_min_height(cta_label, cta_w_est, _min_size_for(imp)))
+        items.append(("cta", primary_cta, imp, min_h, _natural_size("cta", imp, avail_w, avail_h)))
     if legal:
         imp = importances["legal"]
         min_h = max(10.0, _text_min_height(legal, avail_w, _min_size_for(imp)))
@@ -1075,7 +1112,13 @@ def _layout_wide(
         sub_items.append((f"body_{i}", bt, imp, min_h, _natural_size("body", imp, text_w, body_h)))
     if primary_cta:
         imp = importances["cta"]
-        sub_items.append(("cta", primary_cta, imp, 30, _natural_size("cta", imp, text_w, body_h)))
+        _, cta_members = primary_cta
+        cta_label = next((m for m in cta_members if m["type"] == "text"), None)
+        cta_w_est = min(text_w, max(text_w * 0.7, 150))
+        min_h = 30.0
+        if cta_label is not None:
+            min_h = max(min_h, _text_min_height(cta_label, cta_w_est, _min_size_for(imp)))
+        sub_items.append(("cta", primary_cta, imp, min_h, _natural_size("cta", imp, text_w, body_h)))
     if legal:
         imp = importances["legal"]
         min_h = max(10.0, _text_min_height(legal, text_w, _min_size_for(imp)))
@@ -1137,12 +1180,31 @@ def _layout_strip(
     has_secondary = bool(secondary)
 
     avail_h = max(6.0, th - 2 * pad)
-    headline_imp = importances.get("headline", 0.5) if headline else 0.5
-    primary_frac = 0.54 + 0.24 * headline_imp
+
+    # Width shares don't depend on the primary/secondary height split (they
+    # only depend on row_w), so they can be computed up front - which lets
+    # the split itself be informed by what the secondary band actually
+    # needs, instead of a fixed importance-based guess that has no idea
+    # whether it's handing a 6-item row enough height or not.
+    slot_sizes, sgap = _distribute([(imp, 6.0) for _, imp, _ in secondary], row_w) if has_secondary else ([], 0.0)
+    secondary_true_need = 0.0
+    for (item, imp, is_group), sw_ in zip(secondary, slot_sizes):
+        label = item if (not is_group and item.get("type") == "text") else None
+        if is_group:
+            label = next((m for m in item[1] if m["type"] == "text"), None)
+        if label is not None:
+            secondary_true_need = max(secondary_true_need, _text_min_height(label, sw_, _min_size_for(imp, scale=0.5, floor=5.0)))
+
     if has_secondary and avail_h >= 40:
-        primary_h = round(avail_h * primary_frac)
         gap = max(2.0, th * 0.03)
-        secondary_h = max(8.0, avail_h - primary_h - gap)
+        # The secondary band gets what it actually needs first (capped so
+        # it can't swallow the whole row either) - it's the cheaper ask in
+        # absolute pixels, same reasoning as `_priority_allocate`'s water
+        # filling. The headline/CTA primary row gets whatever's left, with
+        # its own content-aware growth below still able to claim a little
+        # more if there's genuine slack.
+        secondary_h = max(8.0, min(secondary_true_need, avail_h * 0.55))
+        primary_h = max(10.0, avail_h - secondary_h - gap)
     else:
         primary_h = avail_h
         gap = 0.0
@@ -1164,32 +1226,27 @@ def _layout_strip(
     headline_w = max(10.0, headline_right - x)
     if headline:
         h_min = _min_size_for(importances["headline"], scale=0.7, floor=7.5)
-        # `primary_frac` above is an importance-based guess; now that the
-        # headline's actual width is known, check what it really needs and
-        # borrow a bit more from the secondary band if the guess undershot -
-        # the same content-aware-minimum idea as `_flow_sizes`, applied to
-        # the strip's row/band split instead of a vertical stack.
-        if secondary_h > 8.0:
-            needed = _text_min_height(headline, headline_w, h_min)
-            grow = min(max(0.0, needed - primary_h), secondary_h - 8.0)
-            if grow > 0:
-                primary_h += grow
-                secondary_h -= grow
+        # primary_h already accounts for the secondary band's real need
+        # (computed above); if headline still wants more than that, it
+        # shrinks via _fit_font_size's own search rather than clawing
+        # space back from a secondary band that was sized to protect.
+        if _text_min_height(headline, headline_w, h_min) > primary_h:
+            h_min = 5.0
         out.append(_place_text(headline, (x, y0, headline_w, primary_h), min_size=h_min))
 
     if primary_cta:
         _, members = primary_cta
         cta_x = pad + row_w - cta_w
         c_min = _min_size_for(importances["cta"], scale=0.6, floor=7.0)
+        cta_label = next((m for m in members if m["type"] == "text"), None)
+        if cta_label is not None and _text_min_height(cta_label, cta_w, c_min) > primary_h:
+            c_min = 5.0
         out.extend(_apply_group_transform(members, _group_bbox(members), (cta_x, y0, cta_w, primary_h), min_size=c_min))
 
     if has_secondary:
-        # Importance-weighted split, not an equal share - the most
-        # important leftover item (e.g. the hero image, or a badge much
-        # larger than the others) gets the biggest sliver of this
-        # already-scarce band instead of everyone getting an identical
-        # fraction regardless of how much it matters.
-        slot_sizes, sgap = _distribute([(imp, 6.0) for _, imp, _ in secondary], row_w)
+        # `slot_sizes`/`sgap` (the importance-weighted width split) were
+        # already computed above, to size `secondary_h` itself - reused
+        # here rather than recomputed.
         if secondary_h > 0:
             slot_y, slot_h, scale, floor = y0 + primary_h + gap, secondary_h, 0.5, 5.0
         else:
@@ -1198,7 +1255,18 @@ def _layout_strip(
         sx = pad
         for (item, imp, is_group), sw_ in zip(secondary, slot_sizes):
             box = (sx, slot_y, sw_, slot_h)
-            min_size = _min_size_for(imp, scale=scale, floor=floor)
+            base_min = _min_size_for(imp, scale=scale, floor=floor)
+            min_size = base_min
+            # The row/column split above sizes this slot by importance
+            # share, not by what its actual text needs - check at the
+            # width it actually got, and shrink further (same idea as
+            # `_adjusted_min_size`) rather than let it overflow into
+            # whatever's next.
+            label_for_check = item if (not is_group and item["type"] == "text") else None
+            if is_group:
+                label_for_check = next((m for m in item[1] if m["type"] == "text"), None)
+            if label_for_check is not None and _text_min_height(label_for_check, sw_, base_min) > slot_h:
+                min_size = 5.0  # let _fit_font_size's own search find the best fit down to the floor
             opacity_mult = 0.60 + 0.30 * max(0.0, min(1.0, imp))
             if is_group:
                 _, members = item
