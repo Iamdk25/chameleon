@@ -3,12 +3,37 @@
 
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
 
 # Virtual environments
 .venv/
+.venv-chameleon/
 venv/
+
+# Local model weights. Not part of the source tree.
+models/*.gguf
+models/*.sha256
+
+# Local notes and generated evidence. Not part of the submission diff.
+.local-archive/
+.cache/
+AGENTS.md
+CONTRIBUTING.md
+docs/
+scripts/context_housekeeping.py
+eval/layout/
+eval/text_context/runs/
+# Research designs and harness. The unit tests use d08.json, checks.py, and driver.py.
+eval/text_context/designs/d04.json
+eval/text_context/designs/d05.json
+eval/text_context/designs/d10.json
+eval/text_context/designs/d11.json
+eval/text_context/designs/d12.json
+tools/text_context_eval.py
+tools/layout_eval/cases.py
+tools/layout_eval/compare.py
+tools/layout_eval/run.py
 
 # cr-renderer is a separate, external open-source project
 # (https://github.com/CyberAgentAILab/cr-renderer), pulled in locally for
@@ -20,3 +45,6 @@ venv/
 # Generated run artifacts
 output/*
 !output/.gitkeep
+
+# Local copy of the challenge PDF
+Final Chameleon Challenge - Adobe cloud storage.pdf

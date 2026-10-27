@@ -1,2 +1,2 @@
-Pillow>=10.0
-git+https://github.com/CyberAgentAILab/cr-renderer
+Pillow==13.0.0
+git+https://github.com/CyberAgentAILab/cr-renderer.git@a17e1fb9a732959dd6c21ae168d5ee09d74bd64f

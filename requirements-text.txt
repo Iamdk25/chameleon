@@ -1,0 +1,6 @@
+# Installed at image build time only when models/*.gguf is present.
+# Not an Adobe-approved runtime. The model file itself is not in Git.
+llama-cpp-python==0.3.36
+diskcache==5.6.3
+jinja2==3.1.6
+MarkupSafe==3.0.4

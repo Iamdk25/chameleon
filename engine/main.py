@@ -12,11 +12,21 @@ manual steps in between.
 """
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
+from engine.contract import (
+    adobe_schema_failures,
+    contract_failures,
+    preserve_unresolved_fields,
+    unresolved_warnings,
+)
 from engine.resize import resize
+from engine.text_context import layout_bridge
+from engine.text_context.analyzer import analyze, judgments_for_resize
+from engine.text_context.entry import ModelRequiredError, select_backend
 
 # Relative to the current working directory, which is /app both inside the
 # Docker image (WORKDIR /app) and when run locally from this repo's root -
@@ -68,41 +78,106 @@ def self_check(source: dict, output: dict) -> list[str]:
     return problems
 
 
+class RendererUnavailable(RuntimeError):
+    """The real renderer could not be imported. A placeholder PNG is not a result."""
+
+
 def render_to_png(design: dict, assets_dir: Path, png_path: Path) -> None:
-    """Renders `design` to a PNG. Prefers the real renderer
-    (transformer-convertor, wrapping cr-renderer) if it's vendored into
-    ./renderer; falls back to a plain box-and-label preview otherwise so
-    this repo is runnable before that's wired in. Swap the fallback out
-    once ./renderer is populated — don't ship the fallback's output as a
-    real preview."""
+    """Render with the vendored cr-renderer. A missing renderer is a failure.
+
+    This is different from a design that references an asset file the brand
+    kit does not contain. The Level 3 holiday watermark is that second case:
+    the renderer still runs and draws its own missing-asset mark.
+    """
     try:
         from renderer.converter.convert import render_design_to_png  # type: ignore
-        render_design_to_png(design, assets_dir, str(png_path))
-        return
-    except ImportError:
-        pass
+    except ImportError as exc:
+        raise RendererUnavailable(
+            "cr-renderer is not importable, so no submission PNG was written. "
+            "Install requirements.txt. A labeled-box placeholder is not a render."
+        ) from exc
+    render_design_to_png(design, assets_dir, str(png_path))
 
-    _fallback_render(design, png_path)
+
+def _artifact_paths(stem: str) -> dict[str, Path]:
+    return {
+        "json": OUTPUT_DIR / f"{stem}_output.json",
+        "png": OUTPUT_DIR / f"{stem}_output.png",
+        "sidecar": OUTPUT_DIR / f"{stem}_sidecar.json",
+    }
 
 
-def _fallback_render(design: dict, png_path: Path) -> None:
-    """Placeholder only — labeled boxes, not real text/asset rendering.
-    Confirms the pipeline runs end-to-end; do not use this to judge your
-    actual layout quality. Use transformer-convertor (RULES.md / FAQ Q3)
-    for a real preview."""
-    from PIL import Image, ImageDraw
+def discard_task_artifacts(stem: str) -> None:
+    """Remove a previous run's files so a failure cannot be read as a result."""
+    for path in _artifact_paths(stem).values():
+        path.unlink(missing_ok=True)
+    for path in OUTPUT_DIR.glob(f"{stem}_output.*.partial"):
+        path.unlink(missing_ok=True)
+    sidecar_partial = OUTPUT_DIR / f"{stem}_sidecar.json.partial"
+    sidecar_partial.unlink(missing_ok=True)
 
-    w, h = design["canvas"]["width"], design["canvas"]["height"]
-    img = Image.new("RGB", (w, h), "#EDE7DD")
-    draw = ImageDraw.Draw(img)
-    palette = {"text": "#2B6CB0", "image": "#B7791F", "shape": "#2F855A"}
-    for el in sorted(design["elements"], key=lambda e: e.get("z_index", 0)):
-        x0, y0 = el["x"], el["y"]
-        x1, y1 = x0 + el["width"], y0 + el["height"]
-        color = palette.get(el["type"], "#555555")
-        draw.rectangle([x0, y0, x1, y1], outline=color, width=3)
-        draw.text((x0 + 4, y0 + 4), el["id"], fill=color)
-    img.save(png_path)
+
+def _model_required() -> bool:
+    return os.environ.get("CHAMELEON_TEXT_MODE", "auto").strip().lower() == "on"
+
+
+def _use_model_cache() -> bool:
+    return os.environ.get("CHAMELEON_TEXT_NO_CACHE", "").strip().lower() not in {"1", "true", "yes"}
+
+
+def _status_label(sidecar: dict) -> str:
+    status = str(sidecar.get("status") or "no-model")
+    if status == "fallback":
+        reason = sidecar.get("fallback_reason") or "no model judgment was used"
+        return f"fallback: {reason}"
+    if status == "no-model":
+        label = "no-model"
+    elif status == "cached_model":
+        label = "cached_model"
+    elif status == "model":
+        label = "model"
+    else:
+        label = status
+    decision = sidecar.get("layout_decision")
+    if decision:
+        label = f"{label}; layout {decision}"
+        if sidecar.get("offer_moved"):
+            label = f"{label}; offer moved"
+        if sidecar.get("accent_moved"):
+            label = f"{label}; accent moved"
+        if sidecar.get("layout_override"):
+            return f"{label}; structural slots retained"
+        return label
+    return label
+
+
+def _publish(stem: str, output: dict, sidecar: dict) -> float:
+    """Render first. Publish JSON, PNG, and sidecar only after that succeeds.
+
+    Returns the render time in seconds. Layout and model time are recorded
+    by the caller before this runs.
+    """
+    paths = _artifact_paths(stem)
+    partial_png = OUTPUT_DIR / f"{stem}_output.png.partial"
+    partial_json = OUTPUT_DIR / f"{stem}_output.json.partial"
+    partial_side = OUTPUT_DIR / f"{stem}_sidecar.json.partial"
+    try:
+        t_render = time.perf_counter()
+        render_to_png(output, ASSETS_DIR, partial_png)
+        render_s = time.perf_counter() - t_render
+        sidecar.setdefault("phase_s", {})["render"] = round(render_s, 3)
+        partial_json.write_text(json.dumps(output, indent=2) + "\n")
+        partial_side.write_text(json.dumps(sidecar, indent=2) + "\n")
+        partial_json.replace(paths["json"])
+        partial_side.replace(paths["sidecar"])
+        partial_png.replace(paths["png"])
+        return render_s
+    except Exception:
+        partial_png.unlink(missing_ok=True)
+        partial_json.unlink(missing_ok=True)
+        partial_side.unlink(missing_ok=True)
+        discard_task_artifacts(stem)
+        raise
 
 
 def main() -> int:
@@ -112,26 +187,119 @@ def main() -> int:
         print(f"No task files found in {INPUT_DIR}", file=sys.stderr)
         return 1
 
+    # Clear results for every current task before backend selection. A missing
+    # or ambiguous required model must not leave a previous run looking valid.
+    for task_path in task_files:
+        discard_task_artifacts(task_path.stem)
+
+    try:
+        backend, backend_kind = select_backend()
+    except ModelRequiredError as exc:
+        print(f"text-context: {exc}", file=sys.stderr)
+        return 2
+
+    required = _model_required()
     exit_code = 0
     for task_path in task_files:
-        task = json.loads(task_path.read_text())
-        source, target_canvas = task["source"], task["target_canvas"]
-
-        t0 = time.time()
-        output = resize(source, target_canvas)
-        elapsed = time.time() - t0
-
-        problems = self_check(source, output)
         stem = task_path.stem
-        (OUTPUT_DIR / f"{stem}_output.json").write_text(json.dumps(output, indent=2))
-        render_to_png(output, ASSETS_DIR, OUTPUT_DIR / f"{stem}_output.png")
+        try:
+            task = json.loads(task_path.read_text())
+        except json.JSONDecodeError as exc:
+            exit_code = 1 if exit_code == 0 else exit_code
+            print(f"[{task_path.name}] TASK JSON FAILED: {exc}", file=sys.stderr)
+            continue
+        source, target_canvas = task["source"], task["target_canvas"]
+        judgments = None
+        sidecar = {"status": "no-model", "backend": backend_kind, "model_judgment": False}
+        if backend is not None:
+            cache_dir = os.environ.get("CHAMELEON_TEXT_CACHE_DIR")
+            analyze_kwargs = {"use_cache": _use_model_cache()}
+            if cache_dir:
+                analyze_kwargs["cache_dir"] = Path(cache_dir)
+            sidecar = analyze(source, target_canvas, backend, **analyze_kwargs)
+            sidecar["backend"] = backend_kind
+            judgments = judgments_for_resize(sidecar)
+            if sidecar.get("status") in {"model", "cached_model"} and not judgments:
+                sidecar["status"] = "fallback"
+                sidecar["fallback_reason"] = "model status had no usable judgment for every text element"
+                sidecar["judgments"] = {}
+            sidecar["model_judgment"] = sidecar.get("status") in {"model", "cached_model"} and bool(judgments)
+        if required and sidecar.get("status") == "fallback":
+            discard_task_artifacts(stem)
+            exit_code = 2
+            reason = sidecar.get("fallback_reason") or "inference failed"
+            errors = [item.get("error") for item in sidecar.get("attempts") or [] if item.get("error")]
+            if errors:
+                reason = f"{reason}: {errors[-1]}"
+            print(
+                f"[{task_path.name}] MODEL REQUIRED FAILED: {reason}. "
+                "No JSON or PNG was published. A fallback layout is not a successful model result.",
+                file=sys.stderr,
+            )
+            continue
+        t_layout = time.perf_counter()
+        output = resize(source, target_canvas, judgments=judgments)
+        layout_s = time.perf_counter() - t_layout
+        preserved = preserve_unresolved_fields(source, output)
+        failures = contract_failures(source, output, target_canvas, ASSETS_DIR)
+        failures.extend(adobe_schema_failures(output))
+        warnings = unresolved_warnings(source, output, ASSETS_DIR)
+        warnings.extend(preserved)
+        tiny = [
+            f"{element['id']} drawn {float(element['font_size']):.1f}px"
+            for element in output["elements"]
+            if element.get("type") == "text" and float(element.get("font_size") or 0) < 8
+        ]
+        if tiny:
+            warnings.append(
+                "text under 8 px remains (" + ", ".join(tiny) + "); "
+                "Adobe has not set a minimum size, so this is a reported trade-off, not a hidden pass"
+            )
+        if failures:
+            discard_task_artifacts(stem)
+            exit_code = 2 if exit_code == 2 else 1
+            print(
+                f"[{task_path.name}] CONTRACT FAIL after layout {layout_s:.2f}s. "
+                "No JSON or PNG was published.",
+                file=sys.stderr,
+            )
+            for problem in failures:
+                print(f"    contract: {problem}", file=sys.stderr)
+            continue
+        sidecar["layout_decision"] = layout_bridge.last_decision
+        sidecar["offer_moved"] = bool(layout_bridge.last_offer_moved)
+        sidecar["accent_moved"] = bool(layout_bridge.last_accent_moved)
+        sidecar["layout_override"] = layout_bridge.last_layout_override
+        sidecar["preserved_unresolved"] = preserved
+        sidecar["unresolved_warnings"] = warnings
+        attempt = (sidecar.get("attempts") or [{}])[-1]
+        stats = attempt.get("stats") or {}
+        sidecar["phase_s"] = {
+            "hash": stats.get("hash_s"),
+            "load": stats.get("load_s"),
+            "generation": stats.get("wall_s"),
+            "prompt_tokens": stats.get("prompt_tokens"),
+            "output_tokens": stats.get("output_tokens"),
+            "layout": round(layout_s, 3),
+        }
+        try:
+            render_s = _publish(stem, output, sidecar)
+        except RendererUnavailable as exc:
+            exit_code = 2 if exit_code == 2 else 1
+            print(f"[{task_path.name}] RENDER FAILED: {exc}", file=sys.stderr)
+            continue
 
-        status = "OK" if not problems else f"{len(problems)} self-check warning(s)"
-        print(f"[{task_path.name}] {status} in {elapsed:.2f}s "
-              f"-> {stem}_output.json, {stem}_output.png")
-        for p in problems:
-            print(f"    - {p}")
+        label = _status_label(sidecar)
+        print(
+            f"[{task_path.name}] {label} "
+            f"layout {layout_s:.2f}s render {render_s:.2f}s "
+            f"-> {stem}_output.json, {stem}_output.png, {stem}_sidecar.json"
+        )
+        for problem in warnings:
+            print(f"    unresolved: {problem}")
 
+    if backend is None:
+        print("text-context: no-model path (no packaged GGUF, Ollama not requested)")
     return exit_code
 
 
